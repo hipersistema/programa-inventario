@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
-import pandas as pd
+import importlib
 import pyautogui
 import threading
 import time
@@ -11,6 +11,9 @@ import io
 import re
 import datetime
 import webbrowser
+import unicodedata
+import difflib
+import hashlib
 from PIL import Image, ImageTk, ImageDraw, ImageFilter
 import functools
 import shutil
@@ -31,6 +34,28 @@ try:
     HAS_GENAI = True
 except ImportError:
     HAS_GENAI = False
+
+class _ImportPerezoso:
+    """Carga un módulo la primera vez que se usa: la ventana abre más rápido."""
+    def __init__(self, nombre):
+        self._nombre = nombre
+        self._mod = None
+
+    def _cargar(self):
+        if self._mod is None:
+            self._mod = importlib.import_module(self._nombre)
+        return self._mod
+
+    def __getattr__(self, atributo):
+        return getattr(self._cargar(), atributo)
+
+
+pd = _ImportPerezoso("pandas")
+
+
+def _declarar_dependencias_para_pyinstaller():
+    """Nunca se llama. Existe para que PyInstaller detecte e incluya pandas."""
+    import pandas  # noqa: F401
 
 pyautogui.FAILSAFE = True
 
@@ -57,6 +82,9 @@ def get_catalogo_path():
 def get_historial_path():
     return os.path.join(get_appdata_folder(), "historial_tandas.json")
 
+def get_borrador_path():
+    return os.path.join(get_appdata_folder(), "borrador_manual.json")
+
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -67,6 +95,150 @@ def get_local_ip():
     finally:
         s.close()
     return ip
+
+
+# =====================================================================
+#  UTILIDADES DE SEGURIDAD: normalización, escritura atómica, respaldos
+# =====================================================================
+LIMITE_KG_ALERTA = 30.0   # por encima de esto se avisa (posible error de dedo)
+
+# Cantidad al final de la línea: "1800", "1800 + 1900", "2,5", opcionalmente con unidad
+RE_CANT_FINAL = re.compile(
+    r'(?<![\w.,+])(\d[\d.,]*(?:\s*\+\s*\d[\d.,]*)*)\s*(kgs?|grs?|g)?\s*$', re.I)
+
+
+def _norm(s):
+    """Mayúsculas y sin tildes (PIÑA = PINA, MELÓN = MELON)."""
+    return "".join(c for c in unicodedata.normalize("NFD", str(s).strip().upper())
+                   if unicodedata.category(c) != "Mn")
+
+
+_IDX_NORM = {"ref": None, "n": -1, "map": {}}
+
+
+def _indice_norm(catalogo):
+    """Índice {nombre_normalizado: código}. Se arma una sola vez por catálogo (el último gana)."""
+    if _IDX_NORM["ref"] is not catalogo or _IDX_NORM["n"] != len(catalogo):
+        mapa = {}
+        for k, v in catalogo.items():
+            mapa[_norm(k)] = v
+        _IDX_NORM["ref"], _IDX_NORM["n"], _IDX_NORM["map"] = catalogo, len(catalogo), mapa
+    return _IDX_NORM["map"]
+
+
+def buscar_exacto_norm(nombre, catalogo):
+    """Busca el nombre ignorando tildes y mayúsculas. Devuelve el código o None."""
+    return _indice_norm(catalogo).get(_norm(nombre))
+
+
+def escribir_json_seguro(path, data):
+    """Escribe en un archivo temporal y luego reemplaza: nunca deja el JSON a medias."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def respaldar_datos(dias_a_conservar=14):
+    """Una copia diaria del historial y del catálogo en la carpeta 'respaldos'."""
+    carpeta = os.path.join(get_appdata_folder(), "respaldos")
+    os.makedirs(carpeta, exist_ok=True)
+    hoy = datetime.date.today().strftime("%Y%m%d")
+    for origen in (get_historial_path(), get_catalogo_path()):
+        if os.path.exists(origen):
+            destino = os.path.join(carpeta, f"{hoy}_{os.path.basename(origen)}")
+            if not os.path.exists(destino):
+                shutil.copy2(origen, destino)
+    limite = time.time() - dias_a_conservar * 86400
+    for n in os.listdir(carpeta):
+        p = os.path.join(carpeta, n)
+        try:
+            if os.path.getmtime(p) < limite:
+                os.remove(p)
+        except Exception:
+            pass
+
+
+def firma_items(items):
+    """items: iterable de (codigo, kg). Devuelve una lista ordenada comparable entre tandas."""
+    return sorted((str(c), f"{float(k):.3f}") for c, k in items)
+
+
+def buscar_tanda_duplicada(df_consolidado, max_tandas=40):
+    """Devuelve la tanda del historial idéntica a la lista actual (o None)."""
+    actual = firma_items(zip(df_consolidado['Codigo'], df_consolidado['Cantidad_Num']))
+    for t in cargar_historial_tandas()[:max_tandas]:
+        try:
+            if firma_items((d["codigo"], d["cantidad"]) for d in t.get("consol_data", [])) == actual:
+                return t
+        except Exception:
+            continue
+    return None
+
+
+def titulo_ventana_activa():
+    """Título de la ventana que tiene el foco (Windows). '' si no se puede leer."""
+    if os.name != "nt":
+        return ""
+    try:
+        import ctypes
+        u32 = ctypes.windll.user32
+        hwnd = u32.GetForegroundWindow()
+        n = u32.GetWindowTextLengthW(hwnd)
+        buf = ctypes.create_unicode_buffer(n + 1)
+        u32.GetWindowTextW(hwnd, buf, n + 1)
+        return buf.value
+    except Exception:
+        return ""
+
+
+def get_prefs_path():
+    return os.path.join(get_appdata_folder(), "preferencias.json")
+
+
+def cargar_preferencias():
+    try:
+        with open(get_prefs_path(), "r", encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def guardar_preferencia(clave, valor):
+    d = cargar_preferencias()
+    d[clave] = valor
+    try:
+        escribir_json_seguro(get_prefs_path(), d)
+    except Exception:
+        pass
+
+
+def cargar_borrador_manual():
+    p = get_borrador_path()
+    if os.path.exists(p):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f).get("texto", "")
+        except Exception:
+            return ""
+    return ""
+
+
+def guardar_borrador_manual(texto):
+    """Guarda el borrador; si está vacío, elimina el archivo."""
+    p = get_borrador_path()
+    try:
+        if texto.strip():
+            escribir_json_seguro(p, {"texto": texto,
+                                     "guardado": datetime.datetime.now().isoformat(timespec="seconds")})
+        elif os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+
 
 def preparar_imagen_ocr(imagen_pil, max_dim=1600, modo="mejorada"):
     """
@@ -120,6 +292,16 @@ Ejemplo:
 """
 
 
+ESQUEMA_OCR = {
+    "type": "ARRAY",
+    "items": {
+        "type": "OBJECT",
+        "properties": {"producto": {"type": "STRING"}, "cantidad": {"type": "STRING"}},
+        "required": ["producto", "cantidad"],
+    },
+}
+
+
 def extraer_filas_json(texto):
     """Convierte la respuesta de la IA en una lista limpia de {'producto','cantidad'} (tolera ```json y texto extra)."""
     t = (texto or "").strip()
@@ -146,6 +328,8 @@ def extraer_filas_json(texto):
     return filas
 
 
+# NOTA: se eliminó "MELÓN": "991" (era el código del cilantro; el melón es "56").
+# REVISAR: "CEBOLLA MORADA" y "NABO CHINO" comparten el código 003279. Confirma en Java cuál es el correcto.
 CATALOGO_BASE = {
     "ACELGA": "999", "AGUACATE": "3", "AJI DULCE ROSA": "4", 
     "AJI JOVITO": "5", "AJI SOVITO": "5", "SOVITO": "5",
@@ -166,8 +350,8 @@ CATALOGO_BASE = {
     "PIÑA": "10", "PLATANO": "76", "REMOLACHA": "79", "REPOLLO BLANCO": "80", "REPOLLO": "80",
     "REPOLLO CHINO": "975", "REPOLLO MORADO": "82", "TOMATE": "85", "TOMATE DE ARBOL": "84", 
     "YUKA": "87", "YUCA": "87", "ZANAHORIA": "88", "ZANAHOSIA": "88", "ZANA HORIA": "88", "NABO CHINO": "003279",
-    "CEBOLLA MORADA": "003279", "MORA": "047886", "GENJIBRE": "40", "AJI DULCE JOVITO": "5", "AJI JOBITO": "5", "SILANDRO": "991",
-    "CASABE PARSIFAL PEQUEÑO": "020114", "MANZANA VERDE": "003103", "CILATRNO": "991", "MELÓN": "991", "ALBAHACA": "007034",
+    "CEBOLLA MORADA": "000971", "MORA": "047886", "GENJIBRE": "40", "AJI DULCE JOVITO": "5", "AJI JOBITO": "5", "SILANDRO": "991",
+    "CASABE PARSIFAL PEQUEÑO": "020114", "MANZANA VERDE": "003103", "CILATRNO": "991", "ALBAHACA": "007034",
     "OCUMOCHINO": "64", "PAPA SUCRA": "66", "CHAYOTA": "001124", "KIWI": "002787", "KIWIS": "002787", "PANELA": "008730","PANELA PAPELON": "008730",
     "PANELA PAPELÓN": "008730","MANDARINA": "003092"
 }
@@ -198,8 +382,7 @@ def guardar_insumo_personalizado(nombre, codigo):
     codigo_clean = str(codigo).strip().upper()
     custom[nombre_clean] = codigo_clean
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(custom, f, ensure_ascii=False, indent=2)
+    escribir_json_seguro(path, custom)
 
 def cargar_historial_tandas():
     path = get_historial_path()
@@ -208,15 +391,17 @@ def cargar_historial_tandas():
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
+            try:   # archivo dañado: se conserva una copia para recuperarlo a mano
+                shutil.copy2(path, path + f".corrupto_{datetime.datetime.now():%Y%m%d_%H%M%S}")
+            except Exception:
+                pass
             return []
     return []
 
 def guardar_tanda_en_historial(tanda_dict):
     historial = cargar_historial_tandas()
     historial.insert(0, tanda_dict) # El más reciente primero
-    path = get_historial_path()
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(historial, f, ensure_ascii=False, indent=2)
+    escribir_json_seguro(get_historial_path(), historial)
 
 def renombrar_tanda_en_historial(id_viejo, id_nuevo):
     """Cambia el ID de una tanda. Devuelve False si el nombre nuevo ya existe o no se halló la tanda."""
@@ -226,8 +411,7 @@ def renombrar_tanda_en_historial(id_viejo, id_nuevo):
     for t in historial:
         if t.get("id") == id_viejo:
             t["id"] = id_nuevo
-            with open(get_historial_path(), "w", encoding="utf-8") as f:
-                json.dump(historial, f, ensure_ascii=False, indent=2)
+            escribir_json_seguro(get_historial_path(), historial)
             return True
     return False
 
@@ -237,8 +421,7 @@ def eliminar_tanda_del_historial(id_tanda):
     for i, t in enumerate(historial):
         if t.get("id") == id_tanda:
             del historial[i]
-            with open(get_historial_path(), "w", encoding="utf-8") as f:
-                json.dump(historial, f, ensure_ascii=False, indent=2)
+            escribir_json_seguro(get_historial_path(), historial)
             return True
     return False
 
@@ -389,13 +572,19 @@ def obtener_codigo(nombre_producto, catalogo):
         codigo_hallado = nombre_limpio
     elif nombre_limpio in catalogo:
         codigo_hallado = catalogo[nombre_limpio]
+    elif (c := buscar_exacto_norm(nombre_limpio, catalogo)) is not None:
+        codigo_hallado = c            # coincidencia exacta ignorando tildes (PINA = PIÑA)
     elif nombre_normalizado in catalogo:
         codigo_hallado = catalogo[nombre_normalizado]
     else:
+        mejor, mejor_r = None, 0.0
         for key, code in catalogo.items():
-            if key in nombre_limpio or nombre_limpio in key:
-                codigo_hallado = code
-                break
+            if len(key) >= 3 and (key in nombre_limpio or nombre_limpio in key):
+                r = difflib.SequenceMatcher(None, key, nombre_limpio).ratio()
+                if r > mejor_r and r >= 0.55:
+                    mejor, mejor_r = code, r
+        if mejor:
+            codigo_hallado = mejor
                 
     if not codigo_hallado:
         codigo_hallado = nombre_limpio
@@ -428,6 +617,66 @@ def parse_cantidad(val):
         converted.append(p)
     return sum(converted)
 
+
+def evaluar_linea_manual(linea, catalogo):
+    """Analiza una línea de la carga manual. nivel: 'ok' | 'warn' | 'err'."""
+    r = {"producto": "", "cantidad": "", "codigo": "", "kg": 0.0,
+         "nivel": "ok", "msg": "", "sugerencias": []}
+    linea = linea.strip()
+    m = RE_CANT_FINAL.search(linea)
+    if not m:
+        r.update(producto=linea.upper(), nivel="err", msg="Falta la cantidad (o está mal escrita)")
+        return r
+
+    r["producto"] = linea[:m.start()].strip().upper()
+    r["cantidad"] = m.group(1).strip()
+    unidad = m.group(2)
+
+    if not r["producto"]:
+        r.update(nivel="err", msg="Falta el nombre del producto")
+        return r
+
+    # --- cantidad ---
+    nums = []
+    for p in r["cantidad"].split("+"):
+        try:
+            nums.append(float(p.strip().replace(",", ".")))
+        except ValueError:
+            r.update(nivel="err", msg=f"Número mal escrito: «{p.strip()}»")
+            return r
+    r["kg"] = parse_cantidad(r["cantidad"])
+    if r["kg"] <= 0:
+        r.update(nivel="err", msg="La cantidad es 0")
+        return r
+
+    # --- producto ---
+    limpio = r["producto"]
+    cod = obtener_codigo(limpio, catalogo)
+    r["codigo"] = cod
+    if not limpio.isdigit() and limpio not in catalogo and buscar_exacto_norm(limpio, catalogo) is None:
+        if cod == limpio:   # no se encontró nada
+            r["sugerencias"] = difflib.get_close_matches(limpio, list(catalogo.keys()), n=3, cutoff=0.6)
+            sug = f" ¿Quisiste decir: {', '.join(r['sugerencias'])}? (doble clic)" if r["sugerencias"] else ""
+            r.update(nivel="err", msg="No está en el catálogo." + sug)
+            return r
+        r["nivel"], r["msg"] = "warn", f"Coincidencia aproximada → código {cod}. Verifica"
+
+    # --- advertencias de cantidad ---
+    avisos = []
+    if any(10 <= n < 100 for n in nums):
+        avisos.append("Un valor entre 10 y 99 se toma como GRAMOS")
+    if any(n >= 10 and not float(n).is_integer() for n in nums):
+        avisos.append("Número con decimales mayor a 10: se lee como GRAMOS (30.000 = 0.03 kg). ¿Querías 30 kg?")
+    if r["kg"] > LIMITE_KG_ALERTA:
+        avisos.append(f"Cantidad muy alta ({r['kg']:.1f} kg)")
+    if unidad:
+        avisos.append(f"Se ignora la unidad «{unidad}»")
+    if avisos:
+        r["nivel"] = "warn"
+        r["msg"] = (r["msg"] + " · " if r["msg"] else "") + " · ".join(avisos)
+    return r
+
+
 HTML_MOBILE = """
 <!DOCTYPE html>
 <html lang="es">
@@ -448,11 +697,11 @@ HTML_MOBILE = """
 <body>
     <div class="card">
         <h2>Frulever 🍎</h2>
-        <p>Selecciona 1 foto de tu galería o tómala directamente con la cámara.</p>
+        <p>Toma una o varias fotos, o elígelas de tu galería.</p>
         <form id="uploadForm" enctype="multipart/form-data">
             <label class="btn-upload">
-                📷 Tomar 1 Foto / Galería
-                <input type="file" name="photo" id="photoInput" accept="image/*" onchange="onFileSelected()">
+                📷 Tomar Foto / Galería
+                <input type="file" name="photo" id="photoInput" accept="image/*" multiple onchange="onFileSelected()">
             </label>
             <div id="fileCount" style="margin-top: 10px; font-weight: bold;"></div>
             <button type="button" id="submitBtn" class="btn-submit" onclick="uploadPhotos()">🚀 Enviar a la PC</button>
@@ -460,43 +709,73 @@ HTML_MOBILE = """
         <div id="status"></div>
     </div>
     <script>
+        const MAX_DIM = 2200;
         function onFileSelected() {
             const input = document.getElementById('photoInput');
             const btn = document.getElementById('submitBtn');
             const count = document.getElementById('fileCount');
-            if(input.files.length > 0) {
-                count.innerText = "Foto seleccionada: " + input.files[0].name;
+            if (input.files.length > 0) {
+                if (input.files.length === 1) {
+                    count.innerText = "Foto seleccionada: " + input.files[0].name;
+                    btn.innerText = "🚀 Enviar a la PC";
+                } else {
+                    count.innerText = input.files.length + " fotos seleccionadas";
+                    btn.innerText = "🚀 Enviar " + input.files.length + " fotos a la PC";
+                }
                 btn.style.display = "block";
             }
+        }
+        async function reducir(file) {
+            try {
+                const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+                const r = Math.min(1, MAX_DIM / Math.max(bmp.width, bmp.height));
+                const w = Math.round(bmp.width * r);
+                const h = Math.round(bmp.height * r);
+                const cv = document.createElement('canvas');
+                cv.width = w;
+                cv.height = h;
+                cv.getContext('2d').drawImage(bmp, 0, 0, w, h);
+                const blob = await new Promise(res => cv.toBlob(res, 'image/jpeg', 0.88));
+                if (blob && blob.size < file.size) return blob;
+            } catch (e) {
+                console.log(e);
+            }
+            return file;
         }
         async function uploadPhotos() {
             const input = document.getElementById('photoInput');
             const status = document.getElementById('status');
             const btn = document.getElementById('submitBtn');
-            if(input.files.length === 0) return;
-
-            const formData = new FormData();
-            formData.append('photo', input.files[0]);
-
-            status.innerText = "⏳ Enviando foto a la PC...";
+            const total = input.files.length;
+            if (total === 0) return;
             btn.disabled = true;
-
-            try {
-                const response = await fetch('/upload', { method: 'POST', body: formData });
-                const res = await response.json();
-                if(res.status === 'ok') {
-                    status.innerHTML = "✅ ¡Enviada con éxito!<br>La PC la está procesando. Puedes tomar otra foto si deseas sumar más.";
-                    status.style.color = "#28A745";
-                } else {
-                    status.innerText = "❌ Error: " + res.message;
-                    status.style.color = "#DC3545";
+            let ok = 0;
+            let fallos = 0;
+            for (let i = 0; i < total; i++) {
+                status.style.color = "#0D6EFD";
+                status.innerText = "⏳ Enviando foto " + (i + 1) + " de " + total + "...";
+                try {
+                    const blob = await reducir(input.files[i]);
+                    const formData = new FormData();
+                    formData.append('photo', blob, 'foto_' + (i + 1) + '.jpg');
+                    const response = await fetch('/upload', { method: 'POST', body: formData });
+                    const res = await response.json();
+                    if (res.status === 'ok') { ok++; } else { fallos++; }
+                } catch (e) {
+                    fallos++;
                 }
-            } catch(e) {
-                status.innerText = "❌ Error de conexión con la PC.";
-                status.style.color = "#DC3545";
-            } finally {
-                btn.disabled = false;
             }
+            if (fallos === 0) {
+                status.innerHTML = "✅ ¡" + ok + (ok === 1 ? " foto enviada" : " fotos enviadas") + " con éxito!<br>La PC las está procesando. Puedes tomar más si deseas sumar.";
+                status.style.color = "#28A745";
+            } else {
+                status.innerText = "⚠️ Enviadas: " + ok + " · con error: " + fallos + ". Revisa la conexión con la PC.";
+                status.style.color = "#DC3545";
+            }
+            input.value = '';
+            document.getElementById('fileCount').innerText = '';
+            btn.style.display = "none";
+            btn.disabled = false;
         }
     </script>
 </body>
@@ -518,11 +797,22 @@ UI_SEL = "#E3E6EA"      # fila seleccionada
 UI_LINE = "#DDE1E5"
 FONT = "Segoe UI"
 
+RAZONES = ("TRANSFERENCIA", "MERMA")
+RAZON_PLACEHOLDER = "Seleccionar…"
+RAZON_COLORES = {"TRANSFERENCIA": ("#E3F0FF", "#1F5FA8"), "MERMA": ("#FDEBD9", "#B25400")}
+
+
+def _mezclar(c1, c2, t):
+    """Mezcla dos colores #RRGGBB (t=0 -> c1, t=1 -> c2). Sirve para animar el hover."""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02X%02X%02X" % tuple(round(x + (y - x) * t) for x, y in zip(a, b))
+
 EMOJI_RE = re.compile(r'^\s*([\U0001F300-\U0001FAFF\u2600-\u27BF])\ufe0f?\s*(.*)$', re.S)
 EMOJI_STRIP_RE = re.compile(r'[\U0001F300-\U0001FAFF\u2600-\u27BF\ufe0f]')
 
 
-@functools.lru_cache(maxsize=256)
+@functools.lru_cache(maxsize=512)
 def make_round_image(w, h, r, fill, bg, border=None, pad=0, shadow=0.0):
     """Rectángulo redondeado con bordes suaves (supermuestreo) y sombra opcional."""
     S = 3
@@ -665,6 +955,7 @@ class PillButton(tk.Canvas):
         self._danger = False
         self._over = False
         self._down = False
+        self._t, self._target, self._anim_job = 0.0, 0.0, None
         self._font = tkfont.Font(family=font[0], size=font[1], weight=font[2] if len(font) > 2 else "normal")
         self._text, self._icon = "", None
         self._set_text(text, icon)
@@ -714,7 +1005,7 @@ class PillButton(tk.Canvas):
         self.delete("all")
         bg = self.master.cget("bg")
         disabled = self._state == "disabled"
-        fill = self._hover_fill if (self._over and not disabled) else self._fill
+        fill = self._fill if disabled else _mezclar(self._fill, self._hover_fill, self._t)
         border = "#E3E7EA" if disabled else self._border
         self._bg_photo = ImageTk.PhotoImage(make_round_image(
             w, h, (h - 8) // 2, fill, bg, border, 4, 0 if disabled else self._shadow))
@@ -741,9 +1032,29 @@ class PillButton(tk.Canvas):
         self.create_text(x + iw + gap, cy, anchor="w", text=self._text, fill=color, font=self._font)
 
     # ---- eventos ----
+
     def _set_over(self, v):
         self._over = v
+        self._target = 1.0 if v else 0.0
+        self._animar_hover()
+
+    def _animar_hover(self):
+        if not self.winfo_exists():
+            return
+        if self._anim_job:
+            try:
+                self.after_cancel(self._anim_job)
+            except Exception:
+                pass
+            self._anim_job = None
+        paso = 0.34
+        if self._t < self._target:
+            self._t = min(self._target, self._t + paso)
+        elif self._t > self._target:
+            self._t = max(self._target, self._t - paso)
         self._render()
+        if self._t != self._target:
+            self._anim_job = self.after(16, self._animar_hover)
 
     def _on_press(self, e):
         if self._state != "disabled":
@@ -906,6 +1217,7 @@ class HistoryList(tk.Frame):
         finally:
             self.menu.grab_release()
 
+
     def populate(self, tandas, vacio="Aún no hay tandas guardadas"):
         for w in self.body.winfo_children():
             w.destroy()
@@ -927,10 +1239,16 @@ class HistoryList(tk.Frame):
                           font=(FONT, 9), fg=UI_TEXT, bg=self._bg, anchor="w")
             for lbl in (l1, l2, l3):
                 lbl.pack(fill=tk.X)
+            razon = str(t.get("razon", "")).upper()
+            badge = None
+            if razon:
+                bgc, fgc = RAZON_COLORES.get(razon, ("#E9ECEF", "#495057"))
+                badge = tk.Label(inner, text=f"  {razon}  ", font=(FONT, 8, "bold"), bg=bgc, fg=fgc)
+                badge.pack(anchor="w", pady=(5, 0))
             tk.Frame(self.body, bg=UI_LINE, height=1).pack(fill=tk.X)
             widgets = [row, inner, l1, l2, l3]
             self._rows.append(widgets)
-            for w in widgets:
+            for w in widgets + ([badge] if badge else []):
                 w.bind("<Button-1>", lambda e, i=i: self._click(i))
                 w.bind("<Button-3>", lambda e, i=i: self._popup(e, i))
                 w.bind("<Double-1>", lambda e, i=i: self._on_open(i))
@@ -945,12 +1263,168 @@ class HistoryList(tk.Frame):
             w.configure(bg=UI_SEL)
 
 
+# =====================================================================
+#  HELPERS DE MODALES MODERNOS
+# =====================================================================
+def fade_in(win, pasos=8, ms=16):
+    """Aparición suave de una ventana."""
+    try:
+        win.attributes("-alpha", 0.0)
+    except tk.TclError:
+        return
+
+    def paso(i=0):
+        try:
+            win.attributes("-alpha", min(1.0, i / pasos))
+        except tk.TclError:
+            return
+        if i < pasos:
+            win.after(ms, lambda: paso(i + 1))
+    paso()
+
+
+def crear_modal(parent, titulo, ancho, alto, resizable=False, minsize=None):
+    m = tk.Toplevel(parent)
+    m.title(titulo)
+    m.configure(bg=UI_BG)
+    m.resizable(resizable, resizable)
+    if minsize:
+        m.minsize(*minsize)
+    m.transient(parent)
+    try:
+        parent.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - ancho) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - alto) // 3
+        m.geometry(f"{ancho}x{alto}+{max(x, 0)}+{max(y, 0)}")
+    except Exception:
+        m.geometry(f"{ancho}x{alto}")
+    try:
+        m.grab_set()
+    except tk.TclError:
+        pass
+    fade_in(m)
+    return m
+
+
+def entry_pill(parent, textvariable=None, font=(FONT, 11)):
+    caja = tk.Frame(parent, bg="#FFFFFF", highlightthickness=1,
+                    highlightbackground="#C9CED3", highlightcolor="#2F6FB5")
+    e = tk.Entry(caja, textvariable=textvariable, relief="flat", bd=0, bg="#FFFFFF", fg=UI_TEXT,
+                 insertbackground=UI_TEXT, font=font)
+    e.pack(fill=tk.X, padx=10, ipady=7)
+    habilitar_atajos_portapapeles(e)
+    return caja, e
+
+
+def campo_modal(parent, etiqueta, valor="", ayuda=None):
+    bg = parent.cget("bg")
+    tk.Label(parent, text=etiqueta, font=(FONT, 10, "bold"), fg=UI_TEXT, bg=bg,
+             wraplength=430, justify="left").pack(anchor="w", pady=(10, 4))
+    var = tk.StringVar(value=valor)
+    caja, ent = entry_pill(parent, var)
+    caja.pack(fill=tk.X)
+    if ayuda:
+        tk.Label(parent, text=ayuda, font=(FONT, 8), fg=UI_MUTED, bg=bg,
+                 wraplength=430, justify="left").pack(anchor="w", pady=(3, 0))
+    return var, ent
+
+
+ESTILOS_BTN = {
+    "normal": {},
+    "primario": dict(fill=UI_GREEN, border=UI_GREEN, fg="#FFFFFF", hover="#35AE5E", shadow=0.2),
+    "peligro": dict(fill="#FFF7F7", border="#D9534F", fg="#8E1B1B", hover="#FDEBEB"),
+    "violeta": dict(fill="#F4F0FC", border="#B9A3E3", fg="#4B2E83", hover="#E9E0F8"),
+    "naranja": dict(fill="#FFF4E8", border="#F0A560", fg="#9A4F00", hover="#FFE9D2"),
+}
+
+
+def fila_botones(parent, botones, height=44):
+    fila = tk.Frame(parent, bg=parent.cget("bg"))
+    for texto, cmd, estilo in botones:
+        PillButton(fila, text=texto, command=cmd, height=height, **ESTILOS_BTN[estilo]).pack(
+            side=tk.LEFT, expand=True, fill=tk.X, padx=3)
+    return fila
+
+
+class AvisoFinal(tk.Toplevel):
+    """Ventanita de aviso con icono animado (check verde o alerta naranja)."""
+    def __init__(self, parent, titulo, lineas, tipo="ok", boton="Entendido"):
+        super().__init__(parent)
+        self.title(titulo)
+        self.configure(bg=UI_BG)
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+        self._tipo = tipo
+        self._color = UI_GREEN if tipo == "ok" else "#DB8A1F"
+        W, H = 420, 400
+        x = (self.winfo_screenwidth() - W) // 2
+        y = (self.winfo_screenheight() - H) // 3
+        self.geometry(f"{W}x{H}+{x}+{y}")
+
+        card = Card(self, UI_BG, UI_CARD)
+        card.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        c = card.inner
+
+        if tipo == "ok":
+            estilo = ESTILOS_BTN["primario"]
+        else:
+            estilo = dict(fill="#DB8A1F", border="#DB8A1F", fg="#FFFFFF", hover="#E89A33", shadow=0.2)
+        PillButton(c, text=boton, command=self.destroy, height=46, **estilo).pack(
+            side=tk.BOTTOM, fill=tk.X, padx=16, pady=(8, 6))
+
+        self.cv = tk.Canvas(c, width=96, height=96, bg=UI_CARD, highlightthickness=0, bd=0)
+        self.cv.pack(pady=(10, 6))
+        tk.Label(c, text=titulo, font=(FONT + " Semibold", 16), fg=UI_TEXT, bg=UI_CARD,
+                 wraplength=340, justify="center").pack()
+        for l in lineas:
+            tk.Label(c, text=l, font=(FONT, 10), fg=UI_MUTED, bg=UI_CARD,
+                     wraplength=340, justify="center").pack(pady=1)
+
+        self.bind("<Return>", lambda e: self.destroy())
+        self.bind("<Escape>", lambda e: self.destroy())
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        except Exception:
+            pass
+        fade_in(self)
+        self.lift()
+        self.focus_force()
+        self._anim(0)
+
+    def _anim(self, f=0):
+        if not self.winfo_exists():
+            return
+        c = self.cv
+        c.delete("all")
+        c.create_oval(8, 8, 88, 88, outline="#DDE5EA", width=6)
+        c.create_arc(8, 8, 88, 88, start=90, extent=-359.9 * min(f / 18.0, 1.0),
+                     style="arc", outline=self._color, width=6)
+        if f > 18:
+            t = min((f - 18) / 10.0, 1.0)
+            if self._tipo == "ok":
+                p1, p2, p3 = (29, 50), (43, 64), (68, 34)
+                if t <= 0.5:
+                    k = t / 0.5
+                    pts = [p1, (p1[0] + (p2[0] - p1[0]) * k, p1[1] + (p2[1] - p1[1]) * k)]
+                else:
+                    k = (t - 0.5) / 0.5
+                    pts = [p1, p2, (p2[0] + (p3[0] - p2[0]) * k, p2[1] + (p3[1] - p2[1]) * k)]
+                c.create_line(*[v for p in pts for v in p], fill=self._color, width=6,
+                              capstyle="round", joinstyle="round")
+            else:
+                c.create_line(48, 26, 48, 54, fill=self._color, width=6, capstyle="round")
+                c.create_oval(45, 63, 51, 69, fill=self._color, outline=self._color)
+        if f < 30:
+            self.after(18, lambda: self._anim(f + 1))
+
+
 class AppCargaInventario:
     def __init__(self, root):
         self.root = root
         self.root.title("Asistente integral de Inventario - Galerias Hipermarket v0.1 (Beta)")
-        self.root.geometry("1100x540")
-        self.root.minsize(1000, 500)
+        self.root.geometry("1320x580")
+        self.root.minsize(1100, 520)
         
         if os.path.exists("icono.ico"):
             try:
@@ -969,14 +1443,29 @@ class AppCargaInventario:
         self.ejecutando_carga = False
         self.ejecutando_ocr = False
         self.tanda_actual_id = None
+
+        self._progreso = None          # avance de la carga en Java (para retomarla)
+        self._modal_agregar = None     # permite añadir líneas al editor manual si está abierto
+        self._modal_manual = None
+        try:
+            respaldar_datos()
+        except Exception:
+            pass
         
         self._ocr_jobs = []
         self._ocr_lock = threading.Lock()
+        self._fotos_hash = {}                    # huellas de fotos recientes (anti doble envío)
+        self._ocr_sem = threading.Semaphore(2)   # máximo 2 fotos consultando a Gemini a la vez
+        self._modo_rapido = False
         self.crear_interfaz()
         self.actualizar_estado_key_btn()
+        self._actualizar_boton_manual()
+        self._iniciar_preferencias()
         
         if HAS_SERVER_LIBS:
             self.iniciar_servidor_local()
+        fade_in(self.root)
+        threading.Thread(target=lambda: pd.DataFrame, daemon=True).start()   # precarga pandas sin frenar la ventana
 
     def cargar_api_key(self):
         config_path = get_config_path()
@@ -1013,47 +1502,34 @@ class AppCargaInventario:
             self.guardar_api_key(key.strip())
             messagebox.showinfo("Éxito", "¡API Key guardada correctamente!")
 
+
     def abrir_modal_nuevo_insumo(self):
-        modal = tk.Toplevel(self.root)
-        modal.title("➕ Añadir Nuevo Insumo a la BD")
-        modal.geometry("420x250")
-        modal.resizable(False, False)
-        modal.transient(self.root)
-        modal.grab_set()
+        modal = crear_modal(self.root, "Añadir nuevo insumo", 460, 400)
+        card = Card(modal, UI_BG, UI_CARD)
+        card.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        c = card.inner
+        tk.Label(c, text="Registrar nuevo insumo", font=(FONT + " Semibold", 14), fg=UI_TEXT, bg=UI_CARD).pack(anchor="w", pady=(4, 0))
+        tk.Label(c, text="Se guarda en tu catálogo y se aplica a la lista actual.", font=(FONT, 9), fg=UI_MUTED, bg=UI_CARD).pack(anchor="w")
+        var_nom, ent_nombre = campo_modal(c, "Nombre del insumo / alias (ej: MORA)")
+        var_cod, ent_codigo = campo_modal(c, "Código del sistema Java (ej: 047886)")
 
-        tk.Label(modal, text="Registrar Nuevo Insumo / Ingrediente", font=("Calibri", 12, "bold"), fg="#1F4E79").pack(pady=(15, 5))
-
-        tk.Label(modal, text="Nombre del Insumo / Alias (ej: MORA 0800 o MORA):", font=("Calibri", 10)).pack(anchor="w", padx=20, pady=(8, 2))
-        ent_nombre = tk.Entry(modal, font=("Calibri", 11))
-        ent_nombre.pack(fill=tk.X, padx=20)
-        ent_nombre.focus_set()
-        habilitar_atajos_portapapeles(ent_nombre)
-
-        tk.Label(modal, text="Código de Sistema Java (ej: 047886):", font=("Calibri", 10)).pack(anchor="w", padx=20, pady=(8, 2))
-        ent_codigo = tk.Entry(modal, font=("Calibri", 11))
-        ent_codigo.pack(fill=tk.X, padx=20)
-        habilitar_atajos_portapapeles(ent_codigo)
-
-        def guardar():
-            nom = ent_nombre.get().strip()
-            cod = ent_codigo.get().strip()
-
+        def guardar(*_):
+            nom, cod = var_nom.get().strip(), var_cod.get().strip()
             if not nom or not cod:
-                messagebox.showwarning("Campos vacíos", "Debes ingresar tanto el Nombre como el Código del insumo.")
+                messagebox.showwarning("Campos vacíos", "Debes ingresar tanto el Nombre como el Código del insumo.", parent=modal)
                 return
-
             guardar_insumo_personalizado(nom, cod)
             self.catalogo = cargar_catalogo_completo()
-            
-            # Reevaluar la lista actual inmediatamente para actualizar el código en vivo
             if self.df_raw is not None and not self.df_raw.empty:
                 self.procesar_df_crudo()
-
-            messagebox.showinfo("Éxito", f"¡Insumo registrado correctamente!\n\n• {nom.upper()} ➔ Código: {cod}")
+            messagebox.showinfo("Éxito", f"¡Insumo registrado!\n\n• {nom.upper()} ➔ Código: {cod}", parent=modal)
             modal.destroy()
 
-        btn_guardar = tk.Button(modal, text="💾 Guardar Insumo", command=guardar, bg="#28A745", fg="white", font=("Calibri", 11, "bold"), cursor="hand2")
-        btn_guardar.pack(fill=tk.X, padx=20, pady=20)
+        fila_botones(c, [("Cancelar", modal.destroy, "normal"),
+                         ("💾 Guardar insumo", guardar, "primario")]).pack(fill=tk.X, side=tk.BOTTOM, pady=(14, 4))
+        modal.bind("<Return>", guardar)
+        modal.bind("<Escape>", lambda e: modal.destroy())
+        ent_nombre.focus_set()
 
     def _crear_logo(self, parent):
         """Usa 'logo.png' (junto al script) si existe; si no, dibuja un logo de respaldo."""
@@ -1107,6 +1583,37 @@ class AppCargaInventario:
         s.configure("Thin.Vertical.TScrollbar", troughcolor=UI_CARD, background="#C3C9CF", bordercolor=UI_CARD,
                     lightcolor="#C3C9CF", darkcolor="#C3C9CF", gripcount=0, width=8, relief="flat")
         s.map("Thin.Vertical.TScrollbar", background=[("active", "#A9B1B8")])
+        # Barra de scroll horizontal (mismo estilo delgado)
+        s.layout("Thin.Horizontal.TScrollbar", [("Horizontal.Scrollbar.trough", {
+            "sticky": "ew", "children": [("Horizontal.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
+        s.configure("Thin.Horizontal.TScrollbar", troughcolor=UI_CARD, background="#C3C9CF", bordercolor=UI_CARD,
+                    lightcolor="#C3C9CF", darkcolor="#C3C9CF", gripcount=0, width=10, relief="flat")
+        s.map("Thin.Horizontal.TScrollbar", background=[("active", "#A9B1B8")])
+
+        # Tablas compactas para modales
+        s.configure("Mini.Treeview", background=UI_CARD, fieldbackground=UI_CARD, foreground=UI_TEXT,
+                    rowheight=28, borderwidth=0, relief="flat", font=(FONT, 10))
+        s.configure("Mini.Treeview.Heading", background="#E3E8EC", foreground=UI_TEXT, relief="flat",
+                    borderwidth=0, font=(FONT, 10, "bold"), padding=(8, 6))
+        s.map("Mini.Treeview.Heading", background=[("active", "#E3E8EC")])
+        s.map("Mini.Treeview", background=[("selected", UI_SEL)], foreground=[("selected", UI_TEXT)])
+        s.layout("Mini.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        # Pestañas modernas
+        s.configure("TNotebook", background=UI_BG, borderwidth=0, tabmargins=(0, 0, 0, 0))
+        s.configure("TNotebook.Tab", padding=(18, 8), font=(FONT, 10), background="#D5DCE2",
+                    foreground=UI_TEXT, borderwidth=0)
+        s.map("TNotebook.Tab", background=[("selected", UI_CARD)], font=[("selected", (FONT, 10, "bold"))])
+        # Dropdown de razón
+        s.configure("Pill.TCombobox", fieldbackground="#FFFFFF", background="#FFFFFF", foreground=UI_TEXT,
+                    arrowcolor=UI_MUTED, bordercolor="#C9CED3", lightcolor="#FFFFFF", darkcolor="#FFFFFF",
+                    padding=(10, 6), arrowsize=14)
+        s.map("Pill.TCombobox", fieldbackground=[("readonly", "#FFFFFF")],
+              foreground=[("readonly", UI_TEXT), ("focus", UI_TEXT)],
+              selectbackground=[("readonly", "#FFFFFF"), ("focus", "#FFFFFF")],
+              selectforeground=[("readonly", UI_TEXT), ("focus", UI_TEXT)],
+              bordercolor=[("focus", "#2F6FB5")])
+        self.root.option_add("*TCombobox*Listbox.font", (FONT, 10))
+        self.root.option_add("*TCombobox*Listbox.selectBackground", "#2F6FB5")
 
         self.root.configure(bg=UI_BG)
         self.root.columnconfigure(0, weight=1)
@@ -1132,9 +1639,9 @@ class AppCargaInventario:
         # ---------- Cuerpo: 3 tarjetas ----------
         body = tk.Frame(self.root, bg=UI_BG)
         body.grid(row=1, column=0, sticky="nsew", padx=9, pady=9)
-        body.columnconfigure(0, minsize=274)
+        body.columnconfigure(0, minsize=250, weight=0)
         body.columnconfigure(1, weight=1)
-        body.columnconfigure(2, minsize=259)
+        body.columnconfigure(2, minsize=250, weight=0)
         body.rowconfigure(0, weight=1)
 
         # --- 1. Entrada de datos ---
@@ -1145,13 +1652,24 @@ class AppCargaInventario:
 
         self.lbl_archivo = NoteLabel(inner, UI_CARD)
         self.lbl_archivo.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 6))
+        fila_vel = tk.Frame(inner, bg=UI_CARD)
+        fila_vel.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 8))
+        tk.Label(fila_vel, text="Velocidad de carga", font=(FONT, 9), fg=UI_MUTED, bg=UI_CARD).pack(anchor="w")
+        self.var_velocidad = tk.StringVar(value="Normal")
+        cmb_vel = ttk.Combobox(fila_vel, textvariable=self.var_velocidad, values=("Normal", "Rápido"),
+                               state="readonly", style="Pill.TCombobox", font=(FONT, 10))
+        cmb_vel.pack(fill=tk.X, pady=(3, 0))
+        cmb_vel.bind("<<ComboboxSelected>>", lambda e: (cmb_vel.selection_clear(), cmb_vel.winfo_toplevel().focus_set()))
 
         botones = [("📱 Capturar QR", self.mostrar_modal_qr),
                    ("📷 Buscar Foto PC", self.procesar_foto_thread),
                    ("✍️ Carga Manual", self.abrir_carga_manual),
                    ("📂 Abrir CSV/Excel", self.cargar_archivo)]
         for texto, cmd in botones:
-            PillButton(inner, text=texto, command=cmd, height=46, shadow=0.20).pack(fill=tk.X, pady=1)
+            b = PillButton(inner, text=texto, command=cmd, height=46, shadow=0.20)
+            b.pack(fill=tk.X, pady=1)
+            if "Manual" in texto:
+                self.btn_manual = b
         PillButton(inner, text="🧹 Vaciar", command=self.limpiar_datos, height=46, fill="#FFF7F7",
                    border="#D9534F", fg="#8E1B1B", hover="#FDEBEB", shadow=0.20).pack(fill=tk.X, pady=(6, 1))
 
@@ -1159,7 +1677,13 @@ class AppCargaInventario:
         card_work = Card(body, UI_BG, UI_CARD)
         card_work.grid(row=0, column=1, sticky="nsew", padx=2)
         wi = card_work.inner
-        self._titulo_seccion(wi, "2. Área de Trabajo")
+        fila_tit = self._titulo_seccion(wi, "2. Área de Trabajo")
+        self.var_razon = tk.StringVar(value=RAZON_PLACEHOLDER)
+        self.cmb_razon = ttk.Combobox(fila_tit, textvariable=self.var_razon, values=RAZONES,
+                                      state="readonly", width=16, style="Pill.TCombobox", font=(FONT, 10))
+        self.cmb_razon.pack(side=tk.RIGHT)
+        tk.Label(fila_tit, text="Razón:", font=(FONT, 10), fg=UI_MUTED, bg=UI_CARD).pack(side=tk.RIGHT, padx=(0, 8))
+        self.cmb_razon.bind("<<ComboboxSelected>>", lambda e: (self.cmb_razon.selection_clear(), self.cmb_razon.winfo_toplevel().focus_set()))
         self.banner_ocr = ProcessingBanner(wi)   # se muestra solo mientras se procesa una foto
 
         marco_tabla = tk.Frame(wi, bg=UI_CARD)
@@ -1171,15 +1695,19 @@ class AppCargaInventario:
         columns = ("codigo", "producto", "original", "consolidada")
         self.tree = ttk.Treeview(marco_tabla, columns=columns, show="headings", style="Work.Treeview",
                                  selectmode="browse")
+        self.tree.tag_configure("sin_codigo", foreground="#C62828")
         self.tree.heading("codigo", text="Código", anchor="w")
         self.tree.heading("producto", text="Producto", anchor="w")
         self.tree.heading("original", text="Cantidad Original", anchor="e")
         self.tree.heading("consolidada", text="Cantidad Consolidada", anchor="e")
-        self.tree.column("codigo", width=78, minwidth=60, anchor="w", stretch=False)
-        self.tree.column("producto", width=110, minwidth=80, anchor="w", stretch=True)
-        self.tree.column("original", width=170, minwidth=120, anchor="e", stretch=True)
-        self.tree.column("consolidada", width=165, minwidth=140, anchor="e", stretch=False)
+        # Columnas compactas (stretch=False: no se estiran para llenar todo el ancho).
+        # Si algo no cabe, aparece la barra horizontal; también puedes arrastrar el borde de un encabezado.
+        self.tree.column("codigo", width=80, minwidth=70, anchor="w", stretch=False)
+        self.tree.column("producto", width=170, minwidth=120, anchor="w", stretch=False)
+        self.tree.column("original", width=150, minwidth=110, anchor="e", stretch=False)
+        self.tree.column("consolidada", width=170, minwidth=150, anchor="e", stretch=False)
 
+        # Scroll vertical (se oculta solo cuando no hace falta)
         scrollbar = ttk.Scrollbar(marco_tabla, orient=tk.VERTICAL, command=self.tree.yview,
                                   style="Thin.Vertical.TScrollbar")
 
@@ -1190,8 +1718,22 @@ class AppCargaInventario:
             else:
                 scrollbar.grid(row=0, column=1, sticky="ns")
 
-        self.tree.configure(yscrollcommand=_scroll_tabla)
+        # Scroll horizontal (barra inferior, se oculta solo cuando no hace falta)
+        scrollbar_x = ttk.Scrollbar(marco_tabla, orient=tk.HORIZONTAL, command=self.tree.xview,
+                                    style="Thin.Horizontal.TScrollbar")
+
+        def _scroll_tabla_x(lo, hi):
+            scrollbar_x.set(lo, hi)
+            if float(lo) <= 0.0 and float(hi) >= 1.0:
+                scrollbar_x.grid_remove()
+            else:
+                scrollbar_x.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+
+        self.tree.configure(yscrollcommand=_scroll_tabla, xscrollcommand=_scroll_tabla_x)
         self.tree.grid(row=0, column=0, sticky="nsew")
+        # Shift + rueda del mouse también desplaza de lado a lado
+        self.tree.bind("<Shift-MouseWheel>",
+                       lambda e: self.tree.xview_scroll(int(-e.delta / 120) * 3, "units"))
         self.tree.bind("<Double-1>", self.editar_item_tabla_consol)
 
         # Menú contextual (clic derecho) para lo que ya no tiene botón visible
@@ -1250,11 +1792,13 @@ class AppCargaInventario:
         self.win_raw.geometry("620x420")
         self.win_raw.protocol("WM_DELETE_WINDOW", self.win_raw.withdraw)
         tk.Label(self.win_raw, text="Doble clic para editar un renglón · Supr para eliminarlo",
-                 font=(FONT, 9), fg=UI_MUTED).pack(anchor="w", padx=12, pady=(10, 4))
-        marco_raw = tk.Frame(self.win_raw)
+                 font=(FONT, 9), fg=UI_MUTED, bg=UI_BG).pack(anchor="w", padx=12, pady=(10, 4))
+        self.win_raw.configure(bg=UI_BG)
+        marco_raw = tk.Frame(self.win_raw, bg=UI_CARD)
         marco_raw.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         columns_raw = ("linea", "producto", "cantidad")
-        self.tree_raw = ttk.Treeview(marco_raw, columns=columns_raw, show="headings", height=8)
+        self.tree_raw = ttk.Treeview(marco_raw, columns=columns_raw, show="headings", height=8,
+                                     style="Mini.Treeview")
         self.tree_raw.heading("linea", text="N°")
         self.tree_raw.heading("producto", text="Producto Ingresado")
         self.tree_raw.heading("cantidad", text="Anotación Original")
@@ -1300,6 +1844,20 @@ class AppCargaInventario:
         finally:
             self.menu_tabla.grab_release()
 
+    def _razon_actual(self):
+        v = self.var_razon.get().strip().upper()
+        return v if v in RAZONES else ""
+
+    def _crear_selector_razon(self, parent, bg):
+        """Dropdown de razón (TRANSFERENCIA / MERMA) ligado a la misma variable del menú principal."""
+        fila = tk.Frame(parent, bg=bg)
+        tk.Label(fila, text="Razón:", font=(FONT, 10, "bold"), fg=UI_MUTED, bg=bg).pack(side=tk.LEFT, padx=(0, 8))
+        cmb = ttk.Combobox(fila, textvariable=self.var_razon, values=RAZONES, state="readonly",
+                           width=16, style="Pill.TCombobox", font=(FONT, 10))
+        cmb.pack(side=tk.LEFT)
+        cmb.bind("<<ComboboxSelected>>", lambda e: (cmb.selection_clear(), cmb.winfo_toplevel().focus_set()))
+        return fila
+
     def abrir_lectura_cruda(self, codigo=None):
         """Abre la lectura cruda. Si hay un ítem elegido (o se indica su código), selecciona sus renglones."""
         if codigo is None:
@@ -1340,6 +1898,7 @@ class AppCargaInventario:
         for it in t.get("consol_data", []):
             partes.append(str(it.get("producto", "")))
             partes.append(str(it.get("codigo", "")))
+        partes.append(str(t.get("razon", "")))
         texto = " ".join(partes).lower()
         return all(p in texto for p in q.lower().split())
 
@@ -1378,6 +1937,7 @@ class AppCargaInventario:
             "fecha": now_str,
             "total_crudo": len(raw_list),
             "total_consolidado": len(consol_list),
+            "razon": self._razon_actual(),
             "raw_data": raw_list,
             "consol_data": consol_list
         }
@@ -1390,52 +1950,24 @@ class AppCargaInventario:
 
         return tanda_dict
 
-    def pedir_texto(self, parent, titulo, etiqueta, inicial=""):
-        """Cuadro para escribir un texto. Soporta Ctrl+C / Ctrl+V / clic derecho y tiene botón 'Pegar'."""
-        dlg = tk.Toplevel(parent)
-        dlg.title(titulo)
-        dlg.resizable(False, False)
-        dlg.transient(parent)
-        resultado = {"v": None}
 
-        tk.Label(dlg, text=etiqueta, font=(FONT, 10, "bold")).pack(anchor="w", padx=16, pady=(14, 4))
-        fila = tk.Frame(dlg)
-        fila.pack(fill=tk.X, padx=16)
-        var = tk.StringVar(value=inicial)
-        ent = tk.Entry(fila, textvariable=var, font=(FONT, 11), width=32)
-        ent.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        habilitar_atajos_portapapeles(ent)
-        tk.Button(fila, text="📋 Pegar", command=lambda: (pegar_en_entry(ent), ent.focus_set()),
-                  font=(FONT, 9), cursor="hand2").pack(side=tk.LEFT, padx=(6, 0))
+    def pedir_texto(self, parent, titulo, etiqueta, inicial=""):
+        """Cuadro para escribir un texto. Soporta Ctrl+C / Ctrl+V / clic derecho y botón 'Pegar'."""
+        resultado = {"v": None}
+        dlg = crear_modal(parent, titulo, 500, 270)
+        c = tk.Frame(dlg, bg=UI_BG)
+        c.pack(fill=tk.BOTH, expand=True, padx=20, pady=14)
+        var, ent = campo_modal(c, etiqueta, inicial)
 
         def aceptar(*_):
             resultado["v"] = var.get()
             dlg.destroy()
 
-        def cancelar(*_):
-            dlg.destroy()
-
-        botones = tk.Frame(dlg)
-        botones.pack(fill=tk.X, padx=16, pady=14)
-        tk.Button(botones, text="Aceptar", command=aceptar, bg="#28A745", fg="white",
-                  font=(FONT, 10, "bold"), cursor="hand2", width=12).pack(side=tk.RIGHT)
-        tk.Button(botones, text="Cancelar", command=cancelar, bg="#6C757D", fg="white",
-                  font=(FONT, 10), cursor="hand2", width=10).pack(side=tk.RIGHT, padx=(0, 8))
+        fila_botones(c, [("Cancelar", dlg.destroy, "normal"),
+                         ("📋 Pegar", lambda: (pegar_en_entry(ent), ent.focus_set()), "normal"),
+                         ("Aceptar", aceptar, "primario")]).pack(fill=tk.X, side=tk.BOTTOM, pady=(14, 0))
         dlg.bind("<Return>", aceptar)
-        dlg.bind("<Escape>", cancelar)
-
-        dlg.update_idletasks()
-        try:
-            x = parent.winfo_rootx() + (parent.winfo_width() - dlg.winfo_width()) // 2
-            y = parent.winfo_rooty() + (parent.winfo_height() - dlg.winfo_height()) // 3
-            dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-        except Exception:
-            pass
-        try:
-            dlg.wait_visibility()
-            dlg.grab_set()
-        except tk.TclError:
-            pass
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
         dlg.lift()
         dlg.focus_force()
         ent.focus_set()
@@ -1487,68 +2019,47 @@ class AppCargaInventario:
         if idx is None or idx >= len(self.historial_visible): return
         tanda = self.historial_visible[idx]
 
-        modal = tk.Toplevel(self.root)
-        modal.title(f"Detalle de Tanda - {tanda.get('id')}")
-        modal.geometry("720x520")
-        modal.transient(self.root)
-        modal.grab_set()
+        modal = crear_modal(self.root, f"Detalle de tanda - {tanda.get('id')}", 840, 600)
 
-        # Encabezado Modal
-        frame_top = tk.Frame(modal, bg="#1F4E79", pady=10)
-        frame_top.pack(fill=tk.X)
-        
-        lbl_m_tit = tk.Label(frame_top, text=f"Registro: {tanda.get('id')}", font=("Calibri", 13, "bold"), fg="white", bg="#1F4E79")
-        lbl_m_tit.pack()
-        lbl_m_sub = tk.Label(frame_top, text=f"Fecha: {tanda.get('fecha')} | Items: {tanda.get('total_consolidado')}", font=("Calibri", 10), fg="#E0E0E0", bg="#1F4E79")
-        lbl_m_sub.pack()
+        razon_t = str(tanda.get("razon", "")).upper() or "—"
+        top = tk.Frame(modal, bg=UI_NAVY)
+        top.pack(fill=tk.X)
+        tk.Label(top, text=str(tanda.get("id")), font=(FONT + " Semibold", 15), fg="#FFFFFF", bg=UI_NAVY).pack(anchor="w", padx=20, pady=(14, 0))
+        tk.Label(top, text=f"{tanda.get('fecha')}   ·   {tanda.get('total_consolidado')} ítems",
+                 font=(FONT, 10), fg="#C9D6E2", bg=UI_NAVY).pack(anchor="w", padx=20)
+        bgc, fgc = RAZON_COLORES.get(razon_t, ("#E9ECEF", "#495057"))
+        tk.Label(top, text=f"  Razón: {razon_t}  ", font=(FONT, 9, "bold"), bg=bgc, fg=fgc).pack(anchor="w", padx=20, pady=(8, 14))
 
-        # Tabs de Tablas Internas
+        frame_btns = tk.Frame(modal, bg=UI_BG)
+        frame_btns.pack(fill=tk.X, padx=12, pady=12, side=tk.BOTTOM)
+
         notebook_m = ttk.Notebook(modal)
-        notebook_m.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        notebook_m.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 0))
 
-        # Tab Consolidado
-        tab_c = ttk.Frame(notebook_m)
-        notebook_m.add(tab_c, text="  ✅ Items Consolidados  ")
+        def tabla(tab, cols):
+            marco = tk.Frame(tab, bg=UI_CARD)
+            marco.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+            tr = ttk.Treeview(marco, columns=[c for c, _, _, _ in cols], show="headings", style="Mini.Treeview")
+            for c, t, w, a in cols:
+                tr.heading(c, text=t)
+                tr.column(c, width=w, anchor=a)
+            sc = ttk.Scrollbar(marco, orient=tk.VERTICAL, command=tr.yview, style="Thin.Vertical.TScrollbar")
+            tr.configure(yscrollcommand=sc.set)
+            sc.pack(side=tk.RIGHT, fill=tk.Y)
+            tr.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            return tr
 
-        tree_c = ttk.Treeview(tab_c, columns=("cod", "prod", "cant"), show="headings", height=10)
-        tree_c.heading("cod", text="Código")
-        tree_c.heading("prod", text="Producto")
-        tree_c.heading("cant", text="Cantidad")
-        tree_c.column("cod", width=100, anchor="center")
-        tree_c.column("prod", width=340, anchor="w")
-        tree_c.column("cant", width=120, anchor="e")
-
-        scr_c = ttk.Scrollbar(tab_c, orient=tk.VERTICAL, command=tree_c.yview)
-        tree_c.configure(yscroll=scr_c.set)
-        tree_c.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scr_c.pack(side=tk.RIGHT, fill=tk.Y)
-
+        tab_c = tk.Frame(notebook_m, bg=UI_CARD)
+        notebook_m.add(tab_c, text="  ✅ Items consolidados  ")
+        tree_c = tabla(tab_c, [("cod", "Código", 110, "center"), ("prod", "Producto", 380, "w"), ("cant", "Cantidad", 130, "e")])
         for item in tanda.get("consol_data", []):
             tree_c.insert("", tk.END, values=(item.get("codigo"), item.get("producto"), item.get("cantidad")))
 
-        # Tab Crudo
-        tab_r = ttk.Frame(notebook_m)
-        notebook_m.add(tab_r, text="  📝 Lectura Cruda  ")
-
-        tree_r = ttk.Treeview(tab_r, columns=("nro", "prod", "cant"), show="headings", height=10)
-        tree_r.heading("nro", text="N°")
-        tree_r.heading("prod", text="Producto")
-        tree_r.heading("cant", text="Anotación")
-        tree_r.column("nro", width=50, anchor="center")
-        tree_r.column("prod", width=360, anchor="w")
-        tree_r.column("cant", width=140, anchor="e")
-
-        scr_r = ttk.Scrollbar(tab_r, orient=tk.VERTICAL, command=tree_r.yview)
-        tree_r.configure(yscroll=scr_r.set)
-        tree_r.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scr_r.pack(side=tk.RIGHT, fill=tk.Y)
-
+        tab_r = tk.Frame(notebook_m, bg=UI_CARD)
+        notebook_m.add(tab_r, text="  📝 Lectura cruda  ")
+        tree_r = tabla(tab_r, [("nro", "N°", 60, "center"), ("prod", "Producto", 400, "w"), ("cant", "Anotación", 160, "e")])
         for i, item in enumerate(tanda.get("raw_data", [])):
-            tree_r.insert("", tk.END, values=(i+1, item.get("producto"), item.get("cantidad")))
-
-        # Acciones
-        frame_btns = tk.Frame(modal, pady=10)
-        frame_btns.pack(fill=tk.X, padx=10)
+            tree_r.insert("", tk.END, values=(i + 1, item.get("producto"), item.get("cantidad")))
 
         def imprimir_reporte_html():
             html_content = f"""
@@ -1579,6 +2090,7 @@ class AppCargaInventario:
                 <div class="box">
                     <strong>ID Tanda:</strong> {tanda.get('id')}<br>
                     <strong>Fecha y Hora:</strong> {tanda.get('fecha')}<br>
+                    <strong>Razón:</strong> {tanda.get('razon') or '—'}<br>
                     <strong>Total Renglones Crudos:</strong> {tanda.get('total_crudo')}<br>
                     <strong>Total Consolidado:</strong> {tanda.get('total_consolidado')}
                 </div>
@@ -1606,6 +2118,8 @@ class AppCargaInventario:
             if messagebox.askyesno("Reabrir Tanda", "¿Deseas cargar los datos de esta tanda en la pantalla principal para modificarlos o re-procesarlos?"):
                 self.df_raw = pd.DataFrame(tanda.get("raw_data", []))
                 self.procesar_df_crudo()
+                r = str(tanda.get("razon", "")).upper()
+                self.var_razon.set(r if r in RAZONES else RAZON_PLACEHOLDER)
                 self.lbl_archivo.config(text=f"📜 Tanda {tanda.get('id')} cargada en pantalla", fg="#17A2B8")
                 self.lbl_status.config(text="✓ Listo para procesar", fg="#28A745")
                 self.btn_iniciar.config(state=tk.NORMAL)
@@ -1619,26 +2133,19 @@ class AppCargaInventario:
             if self.eliminar_tanda_historial(idx, parent=modal):
                 modal.destroy()
 
-        btn_imp = tk.Button(frame_btns, text="🖨️ Imprimir Reporte", command=imprimir_reporte_html, bg="#17A2B8", fg="white", font=("Calibri", 10, "bold"), cursor="hand2")
-        btn_imp.pack(side=tk.LEFT, padx=5)
-
-        btn_reopen = tk.Button(frame_btns, text="📋 Cargar en pantalla", command=cargar_en_trabajo, bg="#6F42C1", fg="white", font=("Calibri", 10, "bold"), cursor="hand2")
-        btn_reopen.pack(side=tk.LEFT, padx=5)
-
-        btn_ren = tk.Button(frame_btns, text="✏️ Renombrar", command=renombrar, bg="#FF8C00", fg="white",
-                            font=("Calibri", 10, "bold"), cursor="hand2")
-        btn_ren.pack(side=tk.LEFT, padx=5)
-
-        btn_del = tk.Button(frame_btns, text="🗑️ Eliminar", command=eliminar, bg="#DC3545", fg="white",
-                            font=("Calibri", 10, "bold"), cursor="hand2")
-        btn_del.pack(side=tk.LEFT, padx=5)
-
-        btn_close = tk.Button(frame_btns, text="Cerrar", command=modal.destroy, bg="#6C757D", fg="white", font=("Calibri", 10), cursor="hand2")
-        btn_close.pack(side=tk.RIGHT, padx=5)
+        fila_botones(frame_btns, [
+            ("🖨️ Imprimir", imprimir_reporte_html, "normal"),
+            ("📋 Cargar en pantalla", cargar_en_trabajo, "violeta"),
+            ("✏️ Renombrar", renombrar, "naranja"),
+            ("🗑️ Eliminar", eliminar, "peligro"),
+            ("Cerrar", modal.destroy, "normal"),
+        ]).pack(fill=tk.X)
 
     def limpiar_datos(self):
         self.ejecutando_ocr = False
         self.ejecutando_carga = False
+        self._progreso = None
+        self._fotos_hash = {}
         self.df_raw = None
         self.df_consolidado = None
         for item in self.tree.get_children(): self.tree.delete(item)
@@ -1647,6 +2154,8 @@ class AppCargaInventario:
         self.lbl_status.config(text="Estado: Seleccione un método de entrada", fg="#333333")
         self.btn_iniciar.config(state=tk.DISABLED, text="🚀 INICIAR CARGA EN JAVA", bg="#28A745")
         self.btn_guardar_tanda.config(state=tk.DISABLED)
+
+
 
     def mostrar_modal_qr(self):
         if not HAS_SERVER_LIBS:
@@ -1658,27 +2167,24 @@ class AppCargaInventario:
         qr.add_data(url_local)
         qr.make(fit=True)
         img_qr = qr.make_image(fill_color="black", back_color="white")
-        
-        modal = tk.Toplevel(self.root)
-        modal.title("Escanear QR")
-        modal.geometry("380x420")
-        modal.resizable(False, False)
-        modal.transient(self.root)
-        modal.grab_set()
 
-        lbl_info = tk.Label(modal, text="Escanea este QR con el celular:", font=("Calibri", 12, "bold"), fg="#1F4E79")
-        lbl_info.pack(pady=10)
-
+        modal = crear_modal(self.root, "Escanear QR", 400, 610)
+        card = Card(modal, UI_BG, UI_CARD)
+        card.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        c = card.inner
+        PillButton(c, text="Cerrar", command=modal.destroy, height=44).pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(8, 4))
+        tk.Label(c, text="Escanea con el celular", font=(FONT + " Semibold", 14), fg=UI_NAVY, bg=UI_CARD).pack(pady=(6, 8))
+        self._crear_selector_razon(c, UI_CARD).pack(pady=(0, 12))
         buf = io.BytesIO()
         img_qr.save(buf, format="PNG")
         buf.seek(0)
         img_tk = ImageTk.PhotoImage(Image.open(buf))
-        
-        lbl_img = tk.Label(modal, image=img_tk)
+        marco = tk.Frame(c, bg="#FFFFFF", highlightthickness=1, highlightbackground=UI_LINE)
+        marco.pack()
+        lbl_img = tk.Label(marco, image=img_tk, bg="#FFFFFF")
         lbl_img.image = img_tk
-        lbl_img.pack(pady=5)
-        lbl_url = tk.Label(modal, text=url_local, font=("Calibri", 10, "italic"))
-        lbl_url.pack(pady=10)
+        lbl_img.pack(padx=8, pady=8)
+        tk.Label(c, text=url_local, font=(FONT, 10), fg=UI_MUTED, bg=UI_CARD).pack(pady=10)
 
     def iniciar_servidor_local(self):
         app = Flask(__name__)
@@ -1705,56 +2211,291 @@ class AppCargaInventario:
 
         threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False), daemon=True).start()
 
-    def abrir_carga_manual(self):
-        modal = tk.Toplevel(self.root)
-        modal.title("Carga Manual Rápida (Offline)")
-        modal.geometry("500x450")
-        modal.transient(self.root)
-        modal.grab_set()
+    # =================================================================
+    #  CARGA MANUAL / REVISIÓN: validación en vivo + borrador persistente
+    # =================================================================
+    def _actualizar_boton_manual(self):
+        """Muestra en el botón principal si hay un borrador pendiente."""
+        btn = getattr(self, "btn_manual", None)
+        if btn is not None:
+            btn.config(text="✍️ Carga Manual (borrador)" if cargar_borrador_manual().strip()
+                       else "✍️ Carga Manual")
 
-        lbl_inst = tk.Label(modal, text="Escribe un producto y cantidad por línea.\nEj: cebolla blanca 1800+1900\nzanahoria 2200", 
-                            font=("Calibri", 10), justify=tk.LEFT)
-        lbl_inst.pack(pady=10, padx=10, anchor="w")
+    def abrir_carga_manual(self, texto_inicial=None):
+        """texto_inicial=None -> carga manual normal (con borrador persistente).
+        texto_inicial='...'  -> revisión de la lectura de una foto (no toca el borrador)."""
+        persistir = texto_inicial is None
 
-        txt_input = tk.Text(modal, font=("Consolas", 11), height=15)
-        txt_input.pack(fill=tk.BOTH, expand=True, padx=10)
+        # Evita abrir dos modales a la vez
+        previo = getattr(self, "_modal_manual", None)
+        if previo is not None and previo.winfo_exists():
+            previo.lift()
+            return
+
+        modal = crear_modal(self.root, "Carga Manual Rápida (Offline)" if persistir else "Revisión de la lectura de la foto",
+                            1000, 620, resizable=True, minsize=(860, 460))
+        self._modal_manual = modal
+        modal.columnconfigure(0, weight=1)
+        modal.rowconfigure(1, weight=1)
+
+        estado = {"job": None, "evals": []}
+
+        cab = tk.Frame(modal, bg=UI_BG)
+        cab.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 8))
+        cab.columnconfigure(0, weight=1)
+        izq_cab = tk.Frame(cab, bg=UI_BG)
+        izq_cab.grid(row=0, column=0, sticky="w")
+        tk.Label(izq_cab, text="Carga manual" if persistir else "Revisión de la foto",
+                 font=(FONT + " Semibold", 15), fg=UI_TEXT, bg=UI_BG).pack(anchor="w")
+        tk.Label(izq_cab, justify="left", wraplength=680, font=(FONT, 9), fg=UI_MUTED, bg=UI_BG,
+                 text="Un producto por línea, con la cantidad al final.  Ej: cebolla blanca 1800+1900\n"
+                      "Tab = autocompletar  ·  Rojo = error (bloquea)  ·  Amarillo = revisa  ·  "
+                      "Doble clic en una fila roja = aplicar la sugerencia"
+                      + ("  ·  El borrador se guarda solo." if persistir else "")).pack(anchor="w", pady=(2, 0))
+        # Razón de la tanda (misma variable que el menú principal: se mantienen sincronizados)
+        self._crear_selector_razon(cab, UI_BG).grid(row=0, column=1, sticky="ne", padx=(12, 0))
+
+        cuerpo = tk.PanedWindow(modal, orient=tk.HORIZONTAL, sashwidth=8, bd=0, bg=UI_BG, sashrelief="flat")
+        cuerpo.grid(row=1, column=0, sticky="nsew", padx=10)
+
+        # ---- izquierda: texto ----
+        card_izq = Card(cuerpo, UI_BG, UI_CARD, radius=14, inset=(8, 8))
+        izq = card_izq.inner
+        txt = tk.Text(izq, font=("Consolas", 12), undo=True, wrap="none", width=34, bd=0, relief="flat",
+                      bg="#FFFFFF", fg=UI_TEXT, insertbackground=UI_TEXT, padx=10, pady=8,
+                      selectbackground="#BBD3EE", highlightthickness=1,
+                      highlightbackground="#C9CED3", highlightcolor="#2F6FB5")
+        sb = ttk.Scrollbar(izq, orient=tk.VERTICAL, command=txt.yview, style="Thin.Vertical.TScrollbar")
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y, padx=(4, 0))
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        txt.tag_configure("warn", background="#FFF4D6")
+        txt.tag_configure("err", background="#FBE1E3")
+        cuerpo.add(card_izq, minsize=320)
+
+        # ---- derecha: vista previa ----
+        card_der = Card(cuerpo, UI_BG, UI_CARD, radius=14, inset=(8, 8))
+        der = card_der.inner
+        cols = ("n", "codigo", "producto", "kg", "msg")
+        tv = ttk.Treeview(der, columns=cols, show="headings", selectmode="browse", style="Mini.Treeview")
+        for c_, t_, w_, a_ in (("n", "Línea", 50, "center"), ("codigo", "Código", 80, "w"),
+                               ("producto", "Producto", 150, "w"), ("kg", "Kg", 80, "e"),
+                               ("msg", "Observación", 330, "w")):
+            tv.heading(c_, text=t_)
+            tv.column(c_, width=w_, anchor=a_, stretch=(c_ == "msg"))
+        tv.tag_configure("ok", background="#EAF6EC")
+        tv.tag_configure("warn", background="#FFF4D6")
+        tv.tag_configure("err", background="#FBE1E3")
+        sb2 = ttk.Scrollbar(der, orient=tk.VERTICAL, command=tv.yview, style="Thin.Vertical.TScrollbar")
+        tv.configure(yscrollcommand=sb2.set)
+        sb2.pack(side=tk.RIGHT, fill=tk.Y, padx=(4, 0))
+        tv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        cuerpo.add(card_der, minsize=400)
+
+        lbl_resumen = tk.Label(modal, text="", font=(FONT + " Semibold", 10), anchor="w", bg=UI_BG)
+        lbl_resumen.grid(row=2, column=0, sticky="ew", padx=18, pady=(10, 0))
+
+        # ---- lógica ----
+        def revalidar():
+            if estado["job"]:
+                try:
+                    modal.after_cancel(estado["job"])
+                except Exception:
+                    pass
+            estado["job"] = None
+            texto = txt.get("1.0", "end-1c")
+            if persistir:
+                guardar_borrador_manual(texto)          # borrador siempre al día
+            for t in ("warn", "err"):
+                txt.tag_remove(t, "1.0", "end")
+            tv.delete(*tv.get_children())
+
+            evals, vistos = [], {}
+            for n, linea in enumerate(texto.split("\n"), 1):
+                if not linea.strip():
+                    continue
+                ev = evaluar_linea_manual(linea, self.catalogo)
+                ev["n"] = n
+                if ev["nivel"] != "err" and ev["codigo"]:
+                    if ev["codigo"] in vistos:
+                        if ev["nivel"] == "ok":
+                            ev["nivel"] = "warn"
+                        ev["msg"] = (ev["msg"] + " · " if ev["msg"] else "") + \
+                                    f"Repetido (también en línea {vistos[ev['codigo']]}); se sumará"
+                    else:
+                        vistos[ev["codigo"]] = n
+                evals.append(ev)
+
+                if ev["nivel"] != "ok":
+                    txt.tag_add(ev["nivel"], f"{n}.0", f"{n}.end")
+                tv.insert("", tk.END, iid=str(n), tags=(ev["nivel"],),
+                          values=(n, ev["codigo"], ev["producto"],
+                                  f"{ev['kg']:.3f}" if ev["kg"] else "", ev["msg"] or "✓"))
+            estado["evals"] = evals
+            e = sum(1 for x in evals if x["nivel"] == "err")
+            w = sum(1 for x in evals if x["nivel"] == "warn")
+            ok = len(evals) - e - w
+            lbl_resumen.config(
+                text=f"{len(evals)} líneas  ·  ✓ {ok} correctas  ·  ⚠ {w} por revisar  ·  ✕ {e} con error",
+                fg="#C62828" if e else ("#B26A00" if w else "#2E7D32"))
+            hijos = tv.get_children()
+            if hijos:
+                lineas_txt = int(txt.index("end-1c").split(".")[0])
+                cursor_linea = int(txt.index("insert").split(".")[0])
+                if cursor_linea >= lineas_txt - 1:
+                    tv.see(hijos[-1])
+                elif str(cursor_linea) in hijos:
+                    tv.see(str(cursor_linea))
+
+        def programar(_=None):
+            if estado["job"]:
+                try:
+                    modal.after_cancel(estado["job"])
+                except Exception:
+                    pass
+            estado["job"] = modal.after(250, revalidar)
+
+        def ir_a_linea(n):
+            txt.mark_set("insert", f"{n}.end")
+            txt.see(f"{n}.0")
+            txt.focus_set()
+
+        def aplicar_sugerencia(_=None):
+            sel = tv.selection()
+            if not sel:
+                return
+            n = int(sel[0])
+            ev = next((x for x in estado["evals"] if x["n"] == n), None)
+            if ev and ev["sugerencias"]:
+                txt.delete(f"{n}.0", f"{n}.end")
+                txt.insert(f"{n}.0", f"{ev['sugerencias'][0]} {ev['cantidad']}")
+                try:   # aprende el alias: la próxima vez este nombre ya se reconoce solo
+                    sug = ev["sugerencias"][0]
+                    cod_sug = self.catalogo.get(sug)
+                    alias = str(ev["producto"]).strip().upper()
+                    if cod_sug and alias and alias != sug and not alias.isdigit():
+                        guardar_insumo_personalizado(alias, cod_sug)
+                        self.catalogo = cargar_catalogo_completo()
+                        self.lbl_status.config(text=f"🧠 Aprendido: {alias} → {sug}", fg="#0D6EFD")
+                except Exception:
+                    pass
+                revalidar()
+            elif ev:
+                ir_a_linea(n)
+
+        def autocompletar(_):
+            n = txt.index("insert").split(".")[0]
+            pref = txt.get(f"{n}.0", "insert").strip().upper()
+            if pref and not re.search(r"\d", pref):
+                cands = sorted((k for k in self.catalogo if k.startswith(pref) and not k.isdigit()), key=len)
+                if cands:
+                    txt.delete(f"{n}.0", "insert")
+                    txt.insert("insert", cands[0] + " ")
+                    programar()
+            return "break"
+
+        def cerrar():
+            if not persistir and txt.get("1.0", "end-1c").strip():
+                if not messagebox.askyesno("Cerrar revisión",
+                                           "Si cierras ahora, se descarta la lectura de la foto.\n\n¿Cerrar de todos modos?",
+                                           icon="warning", parent=modal):
+                    return
+            if estado["job"]:
+                try:
+                    modal.after_cancel(estado["job"])
+                except Exception:
+                    pass
+                estado["job"] = None
+            if persistir:
+                guardar_borrador_manual(txt.get("1.0", "end-1c"))   # se conserva el borrador
+            modal.destroy()
+            self._actualizar_boton_manual()
+
+        def descartar():
+            if not txt.get("1.0", "end-1c").strip():
+                return
+            if messagebox.askyesno("Descartar", "¿Borrar todo lo escrito? No se puede deshacer.",
+                                   icon="warning", parent=modal):
+                txt.delete("1.0", tk.END)
+                revalidar()
 
         def procesar_manual():
-            texto = txt_input.get("1.0", tk.END).strip()
-            if not texto: return
-            
-            lineas = texto.split('\n')
-            datos_manuales = []
-            
-            for linea in lineas:
-                linea = linea.strip()
-                if not linea: continue
-                
-                match = re.search(r'([\d.,+]+.*)', linea)
-                if match:
-                    cant_str = match.group(1).strip()
-                    prod_str = linea[:match.start()].strip()
-                    datos_manuales.append({"producto": prod_str, "cantidad": cant_str})
-                else:
-                    datos_manuales.append({"producto": linea, "cantidad": "0"})
+            revalidar()
+            evals = estado["evals"]
+            if not evals:
+                messagebox.showwarning("Sin datos", "No hay líneas para procesar.", parent=modal)
+                return
+            errores = [x for x in evals if x["nivel"] == "err"]
+            if errores:
+                ir_a_linea(errores[0]["n"])
+                messagebox.showerror(
+                    "Hay errores",
+                    f"Corrige las {len(errores)} línea(s) en rojo antes de procesar.\n\n"
+                    f"Primera: línea {errores[0]['n']} → {errores[0]['msg']}", parent=modal)
+                return
+            avisos = [x for x in evals if x["nivel"] == "warn"]
+            if avisos:
+                detalle = "\n".join(f"• Línea {x['n']}: {x['producto']} {x['cantidad']} → {x['msg']}"
+                                    for x in avisos[:8])
+                if len(avisos) > 8:
+                    detalle += f"\n… y {len(avisos) - 8} más"
+                if not messagebox.askyesno("Revisa estas líneas",
+                                           f"Hay {len(avisos)} línea(s) con advertencias:\n\n{detalle}\n\n"
+                                           "¿Procesar de todos modos?", icon="warning", parent=modal):
+                    return
 
-            if datos_manuales:
-                df_nuevo = pd.DataFrame(datos_manuales)
-                if self.df_raw is None or self.df_raw.empty:
-                    self.df_raw = df_nuevo
-                else:
-                    self.df_raw = pd.concat([self.df_raw, df_nuevo], ignore_index=True)
-                
-                self.procesar_df_crudo()
-                self.lbl_archivo.config(text=f"✍️ Carga manual procesada | Total: {len(self.df_raw)} líneas", fg="#FF8C00")
-                self.lbl_status.config(text="✓ Listo para procesar", fg="#28A745")
-                self.btn_iniciar.config(state=tk.NORMAL)
-                self.btn_guardar_tanda.config(state=tk.NORMAL)
-            
+            df_nuevo = pd.DataFrame([{"producto": x["producto"], "cantidad": x["cantidad"]} for x in evals])
+            if self.df_raw is None or self.df_raw.empty:
+                self.df_raw = df_nuevo
+            else:
+                self.df_raw = pd.concat([self.df_raw, df_nuevo], ignore_index=True)
+            self.procesar_df_crudo()
+            origen_txt = "✍️ Carga manual procesada" if persistir else "📷 Foto revisada y procesada"
+            self.lbl_archivo.config(text=f"{origen_txt} | Total: {len(self.df_raw)} líneas", fg="#FF8C00")
+            self.lbl_status.config(text="✓ Listo para procesar", fg="#28A745")
+            self.btn_iniciar.config(state=tk.NORMAL)
+            self.btn_guardar_tanda.config(state=tk.NORMAL)
+
+            if persistir:
+                guardar_borrador_manual("")      # procesado con éxito: ya no hace falta el borrador
             modal.destroy()
+            self._actualizar_boton_manual()
 
-        btn_guardar = tk.Button(modal, text="Procesar Texto", command=procesar_manual, bg="#28A745", fg="white", font=("Calibri", 11, "bold"))
-        btn_guardar.pack(fill=tk.X, padx=10, pady=10)
+        # ---- botones ----
+        barra = tk.Frame(modal, bg=UI_BG)
+        barra.grid(row=3, column=0, sticky="ew", padx=14, pady=12)
+        PillButton(barra, text="💾 Procesar", command=procesar_manual, height=46,
+                   **ESTILOS_BTN["primario"]).pack(side=tk.RIGHT)
+        PillButton(barra, text="Cerrar (guarda borrador)" if persistir else "Cerrar (descartar)",
+                   command=cerrar, height=46).pack(side=tk.RIGHT, padx=8)
+        PillButton(barra, text="🗑️ Descartar borrador" if persistir else "🗑️ Vaciar lista",
+                   command=descartar, height=46, **ESTILOS_BTN["peligro"]).pack(side=tk.LEFT)
+
+        txt.bind("<KeyRelease>", programar)
+        txt.bind("<<Paste>>", lambda e: modal.after(50, programar))
+        txt.bind("<Tab>", autocompletar)
+        tv.bind("<Double-1>", aplicar_sugerencia)
+        modal.protocol("WM_DELETE_WINDOW", cerrar)     # la X también conserva el borrador
+        modal.bind("<Escape>", lambda e: cerrar())
+
+        # ---- recuperar borrador / lectura de foto ----
+        inicial = texto_inicial if texto_inicial is not None else cargar_borrador_manual()
+        if inicial.strip():
+            txt.insert("1.0", inicial)
+            if persistir:
+                modal.title("Carga Manual Rápida — borrador recuperado")
+
+        def agregar_texto(t):
+            """Permite que lleguen más fotos (QR) mientras el editor está abierto."""
+            hay = txt.get("1.0", "end-1c").strip()
+            txt.insert("end-1c", ("\n" if hay else "") + t)
+            programar()
+        self._modal_agregar = agregar_texto
+        modal.bind("<Destroy>", lambda e: setattr(self, "_modal_agregar", None) if e.widget is modal else None)
+
+        revalidar()
+        txt.focus_set()
+        txt.mark_set("insert", "end-1c")
 
     def procesar_foto_thread(self):
         if not HAS_GENAI:
@@ -1767,6 +2508,10 @@ class AppCargaInventario:
 
     def consultar_gemini_con_reintento(self, client, contents, config=None):
         modelos_candidatos = ['gemini-3.6-flash', 'gemini-2.5-flash']   # el 2º es respaldo si el 1º falla
+        _ok_antes = getattr(self, "_modelo_ok", None)
+        if _ok_antes in modelos_candidatos:   # se empieza por el que funcionó la última vez
+            modelos_candidatos.remove(_ok_antes)
+            modelos_candidatos.insert(0, _ok_antes)
         ultimo_error = None
 
         for modelo in modelos_candidatos:
@@ -1777,7 +2522,9 @@ class AppCargaInventario:
                     if config is not None:
                         kwargs["config"] = config
                     response = client.models.generate_content(**kwargs)
-                    if response and response.text: return response.text.strip()
+                    if response and response.text:
+                        self._modelo_ok = modelo
+                        return response.text.strip()
                     ultimo_error = Exception("La IA devolvió una respuesta vacía.")
                 except Exception as e:
                     ultimo_error = e
@@ -1833,6 +2580,16 @@ class AppCargaInventario:
         self.banner_ocr.start()
 
     def _aplicar_resultado_ocr(self, filas, origen, sin_cantidad):
+        # --- Revisión previa: si algo de la lectura es dudoso, se abre el editor para corregirlo ---
+        lineas = [f"{f['producto']} {f['cantidad']}" for f in filas]
+        if self._modal_agregar:                      # ya hay un editor abierto: se añade ahí
+            self._modal_agregar("\n".join(lineas))
+            return
+        if any(evaluar_linea_manual(l, self.catalogo)["nivel"] != "ok" for l in lineas):
+            self.abrir_carga_manual(texto_inicial="\n".join(lineas))
+            self.lbl_status.config(text="👀 Revisa las líneas marcadas antes de continuar", fg="#FF8C00")
+            return
+
         df_nuevo = pd.DataFrame(filas)
         if self.df_raw is None or self.df_raw.empty:
             self.df_raw = df_nuevo
@@ -1856,15 +2613,31 @@ class AppCargaInventario:
             self.lbl_status.config(text="❌ Falta configurar la API Key", fg="#DC3545")
             return
 
+        huella = self._huella_foto(imagen_pil)
+        if huella:
+            ahora = time.time()
+            with self._ocr_lock:
+                visto = self._fotos_hash.get(huella)
+                self._fotos_hash[huella] = ahora
+            if visto and ahora - visto < 90:
+                self.lbl_status.config(text="⚠ Foto repetida (enviada hace instantes): la ignoré", fg="#FF8C00")
+                return
         self.ejecutando_ocr = True
         self._ocr_inicio(origen)
 
+        self._ocr_sem.acquire()
         try:
             client = genai.Client(api_key=self.api_key)
+            config_schema = None
             try:
                 config = genai_types.GenerateContentConfig(temperature=0, response_mime_type="application/json")
             except Exception:
                 config = None
+            try:
+                config_schema = genai_types.GenerateContentConfig(
+                    temperature=0, response_mime_type="application/json", response_schema=ESQUEMA_OCR)
+            except Exception:
+                config_schema = None
 
             # Intento 1: imagen mejorada. Intento 2 (si falla o viene vacía): imagen original en mayor resolución.
             variantes = [("mejorada", 1600), ("original", 2200)]
@@ -1877,7 +2650,8 @@ class AppCargaInventario:
                     else "🔁 Reintentando con otra versión de la imagen...", fg="#0D6EFD")
                 try:
                     img_opt = preparar_imagen_ocr(imagen_pil, max_dim=dim, modo=modo)
-                    res_text = self.consultar_gemini_con_reintento(client, [img_opt, PROMPT_OCR], config)
+                    res_text = self.consultar_gemini_con_reintento(
+                        client, [img_opt, PROMPT_OCR], (config_schema or config) if n == 0 else config)
                     filas = extraer_filas_json(res_text)
                     if filas:
                         break
@@ -1901,7 +2675,10 @@ class AppCargaInventario:
         except Exception as e:
             if self.ejecutando_ocr:
                 self.lbl_status.config(text=f"Error en IA: {e}", fg="#DC3545")
+                if huella:
+                    self._fotos_hash.pop(huella, None)
         finally:
+            self._ocr_sem.release()
             self._ocr_fin(origen)
 
     def ejecutar_ocr_ia_archivos(self):
@@ -1966,7 +2743,8 @@ class AppCargaInventario:
             # Original: texto literal de la foto | Consolidada: suma en kg
             cant_orig = str(row.get('Cantidad_Original', ''))
             cant_cons = f"{row['Cantidad_Num']:.3f} kg"
-            self.tree.insert("", tk.END, iid=idx, values=(codigo, nombre, cant_orig, cant_cons))
+            self.tree.insert("", tk.END, iid=idx, values=(codigo, nombre, cant_orig, cant_cons),
+                             tags=(() if codigo.isdigit() else ("sin_codigo",)))
 
     def _posiciones_raw_de_codigo(self, codigo):
         """Posiciones (0, 1, 2…) de los renglones crudos que pertenecen a un código."""
@@ -1988,6 +2766,7 @@ class AppCargaInventario:
         self.df_raw = df
         self.procesar_df_crudo()
 
+
     def editar_item_tabla_consol(self, event=None):
         if event is not None and self.tree.identify_region(event.x, event.y) != "cell":
             return
@@ -2001,29 +2780,15 @@ class AppCargaInventario:
         orig_ini = str(fila.get('Cantidad_Original', '')).strip()
         cons_ini = float(fila['Cantidad_Num'])
 
-        modal = tk.Toplevel(self.root)
-        modal.title("Editar ítem")
-        modal.geometry("480x340")
-        modal.resizable(False, False)
-        modal.transient(self.root)
-        modal.grab_set()
-
-        tk.Label(modal, text=nombre, font=(FONT + " Semibold", 13), fg="#1F4E79").pack(anchor="w", padx=18, pady=(14, 0))
-        tk.Label(modal, text=f"Código: {codigo}", font=(FONT, 9), fg=UI_MUTED).pack(anchor="w", padx=18)
-
-        tk.Label(modal, text="Cantidad original (lo anotado):", font=(FONT, 10, "bold")).pack(anchor="w", padx=18, pady=(14, 2))
-        var_orig = tk.StringVar(value=orig_ini)
-        ent_orig = tk.Entry(modal, textvariable=var_orig, font=(FONT, 11))
-        ent_orig.pack(fill=tk.X, padx=18)
-        habilitar_atajos_portapapeles(ent_orig)
-        tk.Label(modal, text="Puedes sumar con +  (ej: 1800 + 1900). La consolidada se recalcula sola.",
-                 font=(FONT, 8), fg=UI_MUTED).pack(anchor="w", padx=18, pady=(2, 0))
-
-        tk.Label(modal, text="Cantidad consolidada (kg):", font=(FONT, 10, "bold")).pack(anchor="w", padx=18, pady=(12, 2))
-        var_cons = tk.StringVar(value=f"{cons_ini:.3f}")
-        ent_cons = tk.Entry(modal, textvariable=var_cons, font=(FONT, 11))
-        ent_cons.pack(fill=tk.X, padx=18)
-        habilitar_atajos_portapapeles(ent_cons)
+        modal = crear_modal(self.root, "Editar ítem", 520, 460)
+        card = Card(modal, UI_BG, UI_CARD)
+        card.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        c = card.inner
+        tk.Label(c, text=nombre, font=(FONT + " Semibold", 14), fg=UI_NAVY, bg=UI_CARD).pack(anchor="w", pady=(4, 0))
+        tk.Label(c, text=f"Código: {codigo}", font=(FONT, 9), fg=UI_MUTED, bg=UI_CARD).pack(anchor="w")
+        var_orig, ent_orig = campo_modal(c, "Cantidad original (lo anotado)", orig_ini,
+                                         "Puedes sumar con +  (ej: 1800 + 1900). La consolidada se recalcula sola.")
+        var_cons, ent_cons = campo_modal(c, "Cantidad consolidada (kg)", f"{cons_ini:.3f}")
 
         def recalcular(*_):
             var_cons.set(f"{parse_cantidad(var_orig.get()):.3f}")
@@ -2039,7 +2804,6 @@ class AppCargaInventario:
             if cons < 0:
                 messagebox.showwarning("Dato inválido", "La cantidad no puede ser negativa.", parent=modal)
                 return
-
             fila_sel = idx
             if orig != orig_ini:
                 if not orig:
@@ -2053,7 +2817,6 @@ class AppCargaInventario:
                 self.lbl_archivo.config(text=f"Lista actualizada | Total: {len(self.df_raw)} líneas")
             else:
                 self.df_consolidado.loc[idx, 'Cantidad_Num'] = cons
-
             self.actualizar_tabla_gui()
             try:
                 self.tree.selection_set(str(fila_sel))
@@ -2065,76 +2828,55 @@ class AppCargaInventario:
             modal.destroy()
             self.abrir_lectura_cruda(codigo)
 
-        btns = tk.Frame(modal)
-        btns.pack(fill=tk.X, padx=18, pady=18)
-        tk.Button(btns, text="💾 Guardar", command=guardar, bg="#28A745", fg="white",
-                  font=(FONT, 10, "bold"), cursor="hand2").pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
-        tk.Button(btns, text="📝 Ver renglones", command=ver_renglones, bg="#6F42C1", fg="white",
-                  font=(FONT, 10, "bold"), cursor="hand2").pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
-        tk.Button(btns, text="Cancelar", command=modal.destroy, bg="#6C757D", fg="white",
-                  font=(FONT, 10), cursor="hand2").pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
-
+        fila_botones(c, [("Cancelar", modal.destroy, "normal"),
+                         ("📝 Ver renglones", ver_renglones, "violeta"),
+                         ("💾 Guardar", guardar, "primario")]).pack(fill=tk.X, side=tk.BOTTOM, pady=(14, 4))
         modal.bind("<Return>", guardar)
         modal.bind("<Escape>", lambda e: modal.destroy())
         ent_orig.focus_set()
         ent_orig.selection_range(0, tk.END)
 
+
     def editar_item_tabla_raw(self, event):
         selected = self.tree_raw.selection()
-        if not selected or self.df_raw is None: return
+        if not selected or self.df_raw is None:
+            return
         idx = self.tree_raw.index(selected[0])
         prod_actual = str(self.df_raw.loc[idx, 'producto'])
         cant_actual = str(self.df_raw.loc[idx, 'cantidad'])
 
-        modal = tk.Toplevel(self.root)
-        modal.title(f"Editar Renglón N° {idx + 1}")
-        modal.geometry("440x230")
-        modal.resizable(False, False)
-        modal.transient(self.root)
-        modal.grab_set()
+        modal = crear_modal(self.win_raw, f"Editar renglón N° {idx + 1}", 480, 380)
+        card = Card(modal, UI_BG, UI_CARD)
+        card.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        c = card.inner
+        tk.Label(c, text=f"Renglón N° {idx + 1}", font=(FONT + " Semibold", 14), fg=UI_NAVY, bg=UI_CARD).pack(anchor="w", pady=(4, 0))
+        var_prod, ent_prod = campo_modal(c, "Nombre del producto", prod_actual)
+        var_cant, ent_cant = campo_modal(c, "Anotación / cantidad", cant_actual)
 
-        tk.Label(modal, text="Nombre del Producto:", font=("Calibri", 10, "bold")).pack(anchor="w", padx=15, pady=(15, 2))
-        ent_prod = tk.Entry(modal, font=("Calibri", 11))
-        ent_prod.pack(fill=tk.X, padx=15)
-        ent_prod.insert(0, prod_actual)
-        habilitar_atajos_portapapeles(ent_prod)
-
-        tk.Label(modal, text="Anotación / Cantidad:", font=("Calibri", 10, "bold")).pack(anchor="w", padx=15, pady=(10, 2))
-        ent_cant = tk.Entry(modal, font=("Calibri", 11))
-        ent_cant.pack(fill=tk.X, padx=15)
-        ent_cant.insert(0, cant_actual)
-        habilitar_atajos_portapapeles(ent_cant)
-
-        def guardar():
-            nuevo_prod = ent_prod.get().strip()
-            nueva_cant = ent_cant.get().strip()
-            if nuevo_prod != "" and nueva_cant != "":
-                self.df_raw.loc[idx, 'producto'] = nuevo_prod
-                self.df_raw.loc[idx, 'cantidad'] = nueva_cant
+        def guardar(*_):
+            np_, nc = var_prod.get().strip(), var_cant.get().strip()
+            if np_ and nc:
+                self.df_raw.loc[idx, 'producto'] = np_
+                self.df_raw.loc[idx, 'cantidad'] = nc
                 self.procesar_df_crudo()
                 modal.destroy()
             else:
-                messagebox.showwarning("Campos vacíos", "Ni el producto ni la cantidad pueden quedar vacíos.")
+                messagebox.showwarning("Campos vacíos", "Ni el producto ni la cantidad pueden quedar vacíos.", parent=modal)
 
         def eliminar():
-            if messagebox.askyesno("Confirmar eliminación", f"¿Seguro que deseas eliminar el renglón N° {idx + 1} ({prod_actual})?"):
+            if messagebox.askyesno("Confirmar eliminación", f"¿Eliminar el renglón N° {idx + 1} ({prod_actual})?", parent=modal):
                 self.df_raw = self.df_raw.drop(index=idx).reset_index(drop=True)
                 self.procesar_df_crudo()
                 total_lineas = len(self.df_raw) if self.df_raw is not None else 0
-                self.lbl_archivo.config(text=f"📋 Lista actualizada | Total: {total_lineas} líneas", fg="#6F42C1")
+                self.lbl_archivo.config(text=f"📋 Lista actualizada | Total: {total_lineas} líneas")
                 modal.destroy()
 
-        btn_frame = tk.Frame(modal)
-        btn_frame.pack(fill=tk.X, padx=15, pady=18)
-        
-        btn_guardar = tk.Button(btn_frame, text="💾 Guardar", command=guardar, bg="#28A745", fg="white", font=("Calibri", 10, "bold"), cursor="hand2")
-        btn_guardar.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
-        
-        btn_eliminar = tk.Button(btn_frame, text="🗑️ Eliminar", command=eliminar, bg="#DC3545", fg="white", font=("Calibri", 10, "bold"), cursor="hand2")
-        btn_eliminar.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
-
-        btn_cancelar = tk.Button(btn_frame, text="Cancelar", command=modal.destroy, bg="#6C757D", fg="white", font=("Calibri", 10), cursor="hand2")
-        btn_cancelar.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=2)
+        fila_botones(c, [("Cancelar", modal.destroy, "normal"),
+                         ("🗑️ Eliminar", eliminar, "peligro"),
+                         ("💾 Guardar", guardar, "primario")]).pack(fill=tk.X, side=tk.BOTTOM, pady=(14, 4))
+        modal.bind("<Return>", guardar)
+        modal.bind("<Escape>", lambda e: modal.destroy())
+        ent_prod.focus_set()
 
     def eliminar_item_tecla_raw(self, event):
         selected = self.tree_raw.selection()
@@ -2276,53 +3018,252 @@ class AppCargaInventario:
             return id_nuevo
         return False   # el nombre ya existía
 
+    # =================================================================
+    #  CARGA EN JAVA: confirmación, tanda repetida, retomar, protección de ventana
+    # =================================================================
+    def _firma_actual(self):
+        return json.dumps(firma_items(zip(self.df_consolidado['Codigo'], self.df_consolidado['Cantidad_Num'])))
+
+    def _esperar_ventana(self, titulo_objetivo):
+        """Pausa mientras la ventana activa no sea la de Java. False si el usuario canceló."""
+        if not titulo_objetivo:
+            return True
+        avisado = False
+        while self.ejecutando_carga:
+            if titulo_ventana_activa() == titulo_objetivo:
+                if avisado:
+                    time.sleep(2.0)   # tiempo para volver a hacer clic en 'Artículo:'
+                return True
+            if not avisado:
+                self.lbl_status.config(
+                    text="⏸ Pausado: Java perdió el foco. Vuelve a Java, haz clic en 'Artículo:' (o cancela)",
+                    fg="#FF8C00")
+                avisado = True
+            time.sleep(0.4)
+        return False
+
     def iniciar_proceso_thread(self):
         if self.ejecutando_carga:
             self.ejecutando_carga = False
             self.lbl_status.config(text="🛑 Cancelando...", fg="#DC3545")
             return
+        if self.df_consolidado is None or self.df_consolidado.empty:
+            return
 
-        # Auto-guardar tanda en historial antes de iniciar la carga en Java
-        tanda = self.guardar_tanda_actual(es_autoguardado=True)
-        self.tanda_actual_id = tanda["id"] if tanda else None
+        # 1) Productos sin código: no se puede cargar
+        sin_codigo = self.df_consolidado[~self.df_consolidado['Codigo'].astype(str).str.isdigit()]
+        if not sin_codigo.empty:
+            nombres = "\n".join(f"• {n}" for n in sin_codigo['Producto_Original'].head(10))
+            messagebox.showerror(
+                "Productos sin código",
+                f"Estos productos no tienen código de sistema y no se pueden cargar:\n\n{nombres}\n\n"
+                "Regístralos con «+ Añadir Insumo» o corrige el nombre (doble clic en la fila).")
+            return
 
+        if not self._razon_actual():
+            messagebox.showwarning("Falta la razón",
+                                   "Selecciona la razón de la tanda (TRANSFERENCIA o MERMA) antes de iniciar la carga.")
+            self.cmb_razon.focus_set()
+            return
+        self._razon_carga = self._razon_actual()
+
+        total = len(self.df_consolidado)
+        firma = self._firma_actual()
+        prog = self._progreso
+        misma_lista = bool(prog and prog["firma"] == firma)
+
+        # 2) ¿Hay una carga interrumpida de esta misma lista?
+        desde = 0
+        if misma_lista and 0 < prog["siguiente"] < total:
+            r = messagebox.askyesnocancel(
+                "Carga interrumpida",
+                f"La carga anterior se detuvo después de {prog['siguiente']} de {total} artículos.\n\n"
+                "SÍ = continuar desde el siguiente\n"
+                "NO = empezar desde el principio\n"
+                "CANCELAR = no hacer nada\n\n"
+                "Antes de continuar, verifica en Java que el último artículo quedó bien agregado.")
+            if r is None:
+                return
+            if r:
+                desde = prog["siguiente"]
+
+        # 3) ¿Esta lista ya se cargó antes?
+        if not misma_lista:
+            dup = buscar_tanda_duplicada(self.df_consolidado)
+            if dup and not messagebox.askyesno(
+                    "¿Tanda repetida?",
+                    f"Esta lista es idéntica a la tanda {dup.get('id')} ({dup.get('fecha')}).\n\n"
+                    "¿Seguro que quieres cargarla de nuevo en Java?", icon="warning"):
+                return
+
+        grandes = self.df_consolidado[self.df_consolidado['Cantidad_Num'] > LIMITE_KG_ALERTA]
+        if not grandes.empty:
+            detalle = "\n".join(
+                f"• {r['Producto_Original']}: {r['Cantidad_Num']:.3f} kg  (anotado: {r.get('Cantidad_Original', '')})"
+                for _, r in grandes.head(10).iterrows())
+            if not messagebox.askyesno(
+                    "⚠ Cantidades muy altas",
+                    f"Estos artículos superan {LIMITE_KG_ALERTA:.0f} kg:\n\n{detalle}\n\n"
+                    "¿Seguro que no es un error de dedo?\n\n"
+                    "SÍ = continuar · NO = revisar", icon="warning"):
+                return
+
+        # 4) Confirmación con resumen
+        if desde == 0:
+            total_kg = self.df_consolidado['Cantidad_Num'].sum()
+            if not messagebox.askyesno("Confirmar carga en Java",
+                                       f"Se cargarán {total} artículos ({total_kg:.2f} kg en total).\n"
+                                       f"Razón: {self._razon_actual()}\n\n"
+                                       "¿Iniciar la carga?"):
+                return
+
+        # 5) Guardar la tanda (solo si es una lista nueva)
+        if not misma_lista:
+            tanda = self.guardar_tanda_actual(es_autoguardado=True)
+            self.tanda_actual_id = tanda["id"] if tanda else None
+
+        self._modo_rapido = (self.var_velocidad.get() == "Rápido")
+        pyautogui.PAUSE = 0.04 if self._modo_rapido else 0.1
+        self._progreso = {"firma": firma, "siguiente": desde}
         self.ejecutando_carga = True
         self.btn_iniciar.config(text="🛑 CANCELAR EJECUCIÓN", bg="#DC3545")
-        threading.Thread(target=self.ejecutar_carga_java, daemon=True).start()
+        threading.Thread(target=self.ejecutar_carga_java, args=(desde,), daemon=True).start()
 
-    def ejecutar_carga_java(self):
+    def mostrar_aviso_final(self, tipo, titulo, lineas):
         try:
-            for i in range(5, 0, -1):
+            AvisoFinal(self.root, titulo, lineas, tipo)
+        except Exception:
+            messagebox.showinfo(titulo, "\n".join(lineas))
+
+    def _huella_pantalla(self):
+        """Miniatura en gris de la pantalla para detectar cambios (Java mostrando la descripción)."""
+        try:
+            img = pyautogui.screenshot().convert("L")
+            box = getattr(Image, "Resampling", Image).BOX
+            return img.resize((max(img.width // 4, 1), max(img.height // 4, 1)), box)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _pixeles_distintos(a, b, umbral=30):
+        """Cantidad de píxeles que cambiaron de forma apreciable entre dos miniaturas."""
+        if a is None or b is None or a.size != b.size:
+            return 9999
+        from PIL import ImageChops
+        h = ImageChops.difference(a, b).histogram()
+        return sum(h[umbral + 1:])
+
+    def _esperar_java_responda(self, antes, maximo=3.5, minimo=0.35):
+        """Espera a que Java reaccione al código (la pantalla cambia) y se estabilice.
+        Si no detecta cambio, espera el tiempo completo (igual que el modo Normal)."""
+        t0 = time.time()
+        cambio = False
+        ultima = antes
+        estables = 0
+        while time.time() - t0 < maximo:
+            if not self.ejecutando_carga:
+                return
+            time.sleep(0.12)
+            actual = self._huella_pantalla()
+            if actual is None:   # no se pudo capturar: espera completa
+                restante = maximo - (time.time() - t0)
+                while restante > 0 and self.ejecutando_carga:
+                    time.sleep(0.1)
+                    restante -= 0.1
+                return
+            if not cambio:
+                if self._pixeles_distintos(antes, actual) >= 12:
+                    cambio = True
+                    ultima, estables = actual, 0
+                continue
+            if self._pixeles_distintos(ultima, actual) <= 3:
+                estables += 1
+                if estables >= 2 and time.time() - t0 >= minimo:
+                    return
+            else:
+                estables = 0
+            ultima = actual
+
+    @staticmethod
+    def _huella_foto(img):
+        """Huella corta de una foto para detectar envíos repetidos."""
+        try:
+            box = getattr(Image, "Resampling", Image).BOX
+            return hashlib.md5(img.convert("L").resize((48, 48), box).tobytes()).hexdigest()
+        except Exception:
+            return None
+
+    def _iniciar_preferencias(self):
+        """Recupera la última razón y velocidad usadas, y empieza a guardarlas al cambiar."""
+        prefs = cargar_preferencias()
+        r = str(prefs.get("ultima_razon", "")).upper()
+        if r in RAZONES:
+            self.var_razon.set(r)
+        if prefs.get("velocidad") in ("Normal", "Rápido"):
+            self.var_velocidad.set(prefs["velocidad"])
+        self.var_razon.trace_add("write", lambda *_: self._guardar_pref_razon())
+        self.var_velocidad.trace_add("write", lambda *_: guardar_preferencia("velocidad", self.var_velocidad.get()))
+
+    def _guardar_pref_razon(self):
+        r = self._razon_actual()
+        if r:
+            guardar_preferencia("ultima_razon", r)
+
+    def ejecutar_carga_java(self, desde=0):
+        try:
+            for i in range(3 if getattr(self, "_modo_rapido", False) else 5, 0, -1):
                 if not self.ejecutando_carga: return
                 self.lbl_status.config(text=f"⚠️ INICIANDO EN {i}S... Haz clic en 'Artículo:' en Java", fg="#DC3545")
                 time.sleep(1)
-
             if not self.ejecutando_carga: return
-            self.lbl_status.config(text="⚙️ Carga automática en progreso...", fg="#0D6EFD")
-            
-            for idx, row in self.df_consolidado.iterrows():
+
+            # Ventana de Java = la que tiene el foco ahora. Si es esta app, el usuario no hizo clic en Java.
+            titulo_java = titulo_ventana_activa()
+            if "Asistente integral" in titulo_java:
+                self.lbl_status.config(
+                    text="🛑 No detecté Java en primer plano. Haz clic en 'Artículo:' y vuelve a iniciar", fg="#DC3545")
+                return
+
+            filas = list(self.df_consolidado.iterrows())
+            total = len(filas)
+            for pos in range(desde, total):
                 if not self.ejecutando_carga: break
-                
+                if not self._esperar_ventana(titulo_java): break
+
+                _, row = filas[pos]
                 codigo = str(row['Codigo'])
                 cantidad = f"{row['Cantidad_Num']:.3f}".rstrip('0').rstrip('.')
-                
-                pyautogui.write(codigo, interval=0.08)
+                self.lbl_status.config(
+                    text=f"⚙️ Cargando {pos + 1}/{total}: {row['Producto_Original']}", fg="#0D6EFD")
+
+                rapido = getattr(self, "_modo_rapido", False)
+                intervalo = 0.03 if rapido else 0.08
+
+                pyautogui.write(codigo, interval=intervalo)
+                antes = self._huella_pantalla() if rapido else None
                 pyautogui.press('tab')
-                
-                for _ in range(35):
-                    if not self.ejecutando_carga: break
-                    time.sleep(0.1)
-                    
+                if rapido:
+                    self._esperar_java_responda(antes)   # espera adaptativa (tope 3.5 s)
+                else:
+                    for _ in range(35):
+                        if not self.ejecutando_carga: break
+                        time.sleep(0.1)
                 if not self.ejecutando_carga: break
-                pyautogui.write(cantidad, interval=0.08)
+
+                pyautogui.write(cantidad, interval=intervalo)
                 pyautogui.press('tab')
                 pyautogui.press('enter')
-                time.sleep(0.5)
+                time.sleep(0.4 if rapido else 0.5)
+                self._progreso["siguiente"] = pos + 1     # artículo completado
 
             if self.ejecutando_carga:
+                self._progreso = None
                 self.lbl_status.config(text="🔎 Leyendo el número de ajuste de Java...", fg="#0D6EFD")
-                time.sleep(1.0)   # deja que Java termine de agregar el último artículo
+                time.sleep(1.0)
                 completo, ultimos5, metodo = self.capturar_numero_ajuste()
+                razon = getattr(self, "_razon_carga", "") or "—"
+                tipo, titulo = "ok", "¡Carga finalizada!"
+                lineas = [f"{total} artículos cargados en Java", f"Razón: {razon}"]
                 if ultimos5:
                     nuevo_id = self._renombrar_tanda_con_numero(ultimos5)
                     if nuevo_id:
@@ -2330,21 +3271,34 @@ class AppCargaInventario:
                             text=f"✅ Carga finalizada | Ajuste {completo} → {nuevo_id}"
                             + (" (leído de la pantalla, verifícalo)" if metodo == "pantalla" else ""),
                             fg="#28A745")
+                        lineas += [f"Ajuste: {completo}", f"Tanda: {nuevo_id}"]
+                        if metodo == "pantalla":
+                            tipo, titulo = "warn", "Carga finalizada (verifica el ajuste)"
+                            lineas.append("El número se leyó de la pantalla, confírmalo en Java.")
                     elif nuevo_id is False:
                         self.lbl_status.config(
                             text=f"⚠ Carga finalizada, pero ya existe una tanda con el código {ultimos5}. Renómbrala en el historial",
                             fg="#FF8C00")
+                        tipo, titulo = "warn", "Carga finalizada"
+                        lineas.append(f"Ya existe una tanda con el código {ultimos5}. Renómbrala en el historial.")
                     else:
                         self.lbl_status.config(text="✅ ¡CARGA FINALIZADA CON ÉXITO!", fg="#28A745")
+                        lineas.append(f"Ajuste: {completo}")
                 else:
                     self.lbl_status.config(
                         text="⚠ Carga finalizada, pero no pude leer el número de ajuste. Renombra la tanda manualmente",
                         fg="#FF8C00")
+                    tipo, titulo = "warn", "Carga finalizada"
+                    lineas.append("No pude leer el número de ajuste. Renombra la tanda manualmente.")
+                self._ui(lambda: self.mostrar_aviso_final(tipo, titulo, lineas))
             else:
-                self.lbl_status.config(text="🛑 Carga cancelada.", fg="#DC3545")
+                sig = self._progreso["siguiente"] if self._progreso else 0
+                self.lbl_status.config(
+                    text=f"🛑 Carga cancelada tras {sig} de {total} artículos. Puedes retomarla con INICIAR",
+                    fg="#DC3545")
 
         except pyautogui.FailSafeException:
-            self.lbl_status.config(text="🛑 CARGA ABORTADA.", fg="#DC3545")
+            self.lbl_status.config(text="🛑 CARGA ABORTADA (puedes retomarla con INICIAR).", fg="#DC3545")
         except Exception as e:
             self.lbl_status.config(text=f"Error: {e}", fg="#DC3545")
         finally:
